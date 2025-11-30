@@ -1,0 +1,50 @@
+# ============================
+# 🔹 Entornos virtuales
+# ============================
+.venv/
+venv/
+
+# ============================
+# 🔹 Node modules
+# ============================
+node_backend/node_modules/
+
+# ============================
+# 🔹 Sesiones de WhatsApp (solo contenido)
+# ============================
+node_backend/whatsapp-sessions/*
+
+# (Si querés ignorar toda la carpeta completa)
+# node_backend/whatsapp-sessions/
+
+# ============================
+# 🔹 Configuración sensible
+# ============================
+
+# Config en la raíz
+config.json
+
+# Config dentro de python_backend
+python_backend/config.json
+
+# ============================
+# 🔹 Archivos temporales / caché
+# ============================
+__pycache__/
+*.pyc
+
+# ============================
+# 🔹 Entornos JetBrains / PyCharm
+# ============================
+.idea/
+
+# ============================
+# 🔹 Logs
+# ============================
+*.log
+
+# ============================
+# 🔹 Dist / build
+# ============================
+dist/
+build/
