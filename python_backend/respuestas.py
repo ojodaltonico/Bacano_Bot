@@ -46,7 +46,12 @@ def responder(mensaje, numero, estados):
 
             elif mensaje == '3':
                 promotions = get_promotions()
-                return f"🚀 Promo Time en Bacano Club:\n{promotions}\n\n💡 Escribí 'hola' para volver al menú principal"
+                # AQUÍ ESTÁ EL CAMBIO - Formatear correctamente las promociones
+                if isinstance(promotions, list):
+                    promos_formateadas = "\n".join(f"• {promo}" for promo in promotions)
+                else:
+                    promos_formateadas = promotions
+                return f"🚀 Promo Time en Bacano Club:\n{promos_formateadas}\n\n💡 Escribí 'hola' para volver al menú principal"
 
             else:
                 return "❌ Opción no válida. " + mostrar_menu_principal()
@@ -69,9 +74,8 @@ def responder(mensaje, numero, estados):
             else:
                 return "😆 Vamos, jugátela… Sí o No. 😂\n\n💡 Escribí 'hola' para volver al menú principal"
 
-        # Esperando DNI - **CORREGIDO: verificar "hola" aquí también**
+        # Esperando DNI
         elif estado_actual == "esperando_dni":
-            # Si llega "hola" aquí, ya debería haberse capturado arriba, pero por si acaso
             if mensaje in ['hola', 'menu', 'menú', 'volver']:
                 estados[numero] = {"estado": "menu_principal"}
                 return "🔁 Volviendo al menú principal...\n\n" + mostrar_menu_principal()

@@ -1,52 +1,85 @@
 @echo off
-title BacanoBot - Ejecutando
+title BacanoBot - Control Unificado
 color 0A
 
-echo 🚀 Iniciando WhatsApp Bot - Bacano Club...
-echo 📍 Todo en uno - Entorno virtual incluido
-echo.
-
 echo =======================================
-echo   BACANO BOT - Controlador unificado
+echo   🤖 BACANO BOT - Control Unificado
 echo =======================================
 echo.
 
-:: ================================
-:: VALIDAR CONFIG
-:: ================================
-if not exist python_backend\config.json (
-    echo ❌ Falta: python_backend\config.json
-    echo Ejecutá install.bat primero.
-    goto END
+:: Verificar que estamos en el directorio correcto
+if not exist "python_backend\gui_unificado.py" (
+    echo ❌ Error: Debes ejecutar este archivo desde la raíz del proyecto
+    echo.
+    echo La estructura debe ser:
+    echo BacanoBot/
+    echo   ├── run.bat
+    echo   ├── config.json
+    echo   └── python_backend/
+    echo        └── gui_unificado.py
+    echo.
+    pause
+    exit /b 1
 )
 
-:: ================================
-:: ACTIVAR PYTHON
-:: ================================
-echo ✔ Activando entorno virtual Python...
-call venv\Scripts\activate
+:: Verificar entorno virtual
+if not exist "venv\Scripts\python.exe" (
+    echo ⚠ Entorno virtual no encontrado
+    echo Ejecutando install.bat...
+    call install.bat
+    if errorlevel 1 (
+        echo ❌ Error en la instalación
+        pause
+        exit /b 1
+    )
+)
 
-:: INICIAR FLASK
-echo ⏳ Iniciando Flask backend...
-start "" cmd /c "cd python_backend && ..\venv\Scripts\activate && python app.py"
+:: Verificar config.json
+if not exist "config.json" (
+    echo ⚠ Creando config.json de ejemplo...
+    (
+        echo {
+        echo   "database": {
+        echo     "host": "localhost",
+        echo     "user": "root",
+        echo     "password": "",
+        echo     "database": "bacano_db"
+        echo   },
+        echo   "promotions": [
+        echo     "🎊 Champagne para cumpleañeros",
+        echo     "🎊 Entrada Free para cumpleañeros"
+        echo   ]
+        echo }
+    ) > config.json
+    echo ✅ config.json creado
+    echo.
+    echo ⚠ IMPORTANTE: Edita config.json con tus datos de base de datos
+    timeout /t 3 >nul
+)
 
-:: INICIAR GUI
-echo 🖥️ Abriendo interfaz gráfica...
-start "" python python_backend/gui.py
+:: Verificar dependencias Node
+if not exist "node_backend\node_modules" (
+    echo ⚠ Dependencias de Node no encontradas
+    echo Instalando...
+    cd node_backend
+    npm install
+    cd ..
+)
 
-:: INICIAR BAILEYS
-echo ⏳ Iniciando WhatsApp (Node.js)...
-start "WhatsApp Node" cmd /k "cd node_backend && node index.js"
-
-
-
-
+:: Activar entorno virtual y ejecutar GUI directamente SIN nueva terminal
+echo ✅ Iniciando BacanoBot en modo GUI...
 echo.
-echo ======================================
-echo   ✔ Sistema en ejecución
-echo   Cuando aparezca QR: escanealo
-echo ======================================
+echo 📌 Todo se controlará desde la ventana principal
+echo 💡 Cierra la ventana para terminar el programa
 echo.
 
-:END
+:: Ejecutar directamente sin abrir nueva terminal
+"venv\Scripts\python.exe" "python_backend\gui_unificado.py"
+
+:: Cuando se cierre la GUI, terminar todo
+echo.
+echo =======================================
+echo   👋 BacanoBot finalizado
+echo =======================================
+echo.
 pause

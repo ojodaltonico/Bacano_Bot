@@ -25,7 +25,7 @@ node_backend/whatsapp-sessions/*
 config.json
 
 # Config dentro de python_backend
-python_backend/config.json
+config.json
 
 # ============================
 # 🔹 Archivos temporales / caché

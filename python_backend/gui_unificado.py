@@ -6,7 +6,14 @@ import sys
 import os
 import queue
 import json
+import time
 from datetime import datetime
+import importlib.util
+import traceback
+
+# Añadir el directorio actual al path para importaciones
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 class BacanoBotGUI:
@@ -14,7 +21,12 @@ class BacanoBotGUI:
         self.root = root
         self.root.title("🤖 BacanoBot - Control Unificado")
         self.root.geometry("1200x700")
-        self.root.configure(bg='#1a1a1a')
+
+        # Intentar cargar icono
+        try:
+            self.root.iconbitmap("bacano.ico")
+        except:
+            pass
 
         # Procesos
         self.flask_process = None
@@ -24,13 +36,64 @@ class BacanoBotGUI:
         self.flask_queue = queue.Queue()
         self.node_queue = queue.Queue()
 
+        # Estado
+        self.is_flask_running = False
+        self.is_node_running = False
+
         self.setup_ui()
-        self.load_config()
+
+        # Cargar configuración después de crear la UI
+        self.root.after(1000, self.load_config)
 
     def setup_ui(self):
-        # Frame principal con notebook (pestañas)
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill='both', expand=True, padx=10, pady=10)
+        # Configurar grid
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+
+        # Frame principal
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky="nsew")
+
+        # Configurar grid del frame principal
+        main_frame.grid_rowconfigure(1, weight=1)
+        main_frame.grid_columnconfigure(0, weight=1)
+
+        # Barra superior
+        top_frame = ttk.Frame(main_frame)
+        top_frame.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+
+        # Título
+        title_label = ttk.Label(
+            top_frame,
+            text="🤖 BacanoBot - Control Unificado",
+            font=("Arial", 16, "bold")
+        )
+        title_label.grid(row=0, column=0, sticky="w")
+
+        # Botones de control
+        control_frame = ttk.Frame(top_frame)
+        control_frame.grid(row=0, column=1, sticky="e")
+
+        self.start_btn = ttk.Button(
+            control_frame,
+            text="▶️ Iniciar Todo",
+            command=self.start_all,
+            style="success.TButton"
+        )
+        self.start_btn.grid(row=0, column=0, padx=2)
+
+        self.stop_btn = ttk.Button(
+            control_frame,
+            text="⏹️ Detener Todo",
+            command=self.stop_all,
+            style="danger.TButton",
+            state="disabled"
+        )
+        self.stop_btn.grid(row=0, column=1, padx=2)
+
+        # Notebook (pestañas)
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.grid(row=1, column=0, sticky="nsew")
 
         # Pestaña 1: Dashboard
         self.tab_dashboard = ttk.Frame(self.notebook)
@@ -53,90 +116,93 @@ class BacanoBotGUI:
         self.setup_database_tab()
 
         # Barra de estado
-        self.status_bar = tk.Label(
-            self.root,
-            text="🟢 Listo",
-            bd=1,
+        self.status_bar = ttk.Label(
+            main_frame,
+            text="🟢 Listo para iniciar",
             relief=tk.SUNKEN,
-            anchor=tk.W,
-            bg='green',
-            fg='white'
+            anchor=tk.W
         )
-        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
 
-        # Botones de control
-        control_frame = tk.Frame(self.root)
-        control_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
-
-        tk.Button(
-            control_frame,
-            text="▶️ Iniciar Todo",
-            command=self.start_all,
-            bg='#28a745',
-            fg='white',
-            font=('Arial', 10, 'bold')
-        ).pack(side=tk.LEFT, padx=5)
-
-        tk.Button(
-            control_frame,
-            text="⏹️ Detener Todo",
-            command=self.stop_all,
-            bg='#dc3545',
-            fg='white',
-            font=('Arial', 10, 'bold')
-        ).pack(side=tk.LEFT, padx=5)
-
-        tk.Button(
-            control_frame,
-            text="🔄 Reiniciar",
-            command=self.restart_all,
-            bg='#ffc107',
-            fg='black',
-            font=('Arial', 10, 'bold')
-        ).pack(side=tk.LEFT, padx=5)
+        # Estilos
+        self.setup_styles()
 
         # Iniciar monitoreo de logs
-        self.root.after(100, self.update_logs)
+        self.root.after(500, self.update_logs)
+
+    def setup_styles(self):
+        style = ttk.Style()
+
+        # Colores para botones
+        style.configure("success.TButton", foreground="white", background="green")
+        style.configure("danger.TButton", foreground="white", background="red")
+        style.configure("warning.TButton", foreground="black", background="yellow")
 
     def setup_dashboard_tab(self):
-        # Estado de servicios
+        # Frame para estado
         status_frame = ttk.LabelFrame(self.tab_dashboard, text="Estado de Servicios", padding=15)
-        status_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        status_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Grid para status
+        status_frame.grid_columnconfigure(1, weight=1)
 
         # Flask Status
-        self.flask_status = tk.Label(
-            status_frame,
-            text="🔴 Flask Backend - Detenido",
-            font=('Arial', 12),
-            fg='red'
+        ttk.Label(status_frame, text="Flask Backend:", font=("Arial", 11)).grid(
+            row=0, column=0, sticky="w", pady=5, padx=5
         )
-        self.flask_status.grid(row=0, column=0, sticky='w', pady=10, padx=20)
+
+        self.flask_status = ttk.Label(
+            status_frame,
+            text="🔴 Detenido",
+            font=("Arial", 11, "bold"),
+            foreground="red"
+        )
+        self.flask_status.grid(row=0, column=1, sticky="w", pady=5, padx=5)
 
         # Node Status
-        self.node_status = tk.Label(
-            status_frame,
-            text="🔴 WhatsApp Bot - Detenido",
-            font=('Arial', 12),
-            fg='red'
+        ttk.Label(status_frame, text="WhatsApp Bot:", font=("Arial", 11)).grid(
+            row=1, column=0, sticky="w", pady=5, padx=5
         )
-        self.node_status.grid(row=1, column=0, sticky='w', pady=10, padx=20)
+
+        self.node_status = ttk.Label(
+            status_frame,
+            text="🔴 Detenido",
+            font=("Arial", 11, "bold"),
+            foreground="red"
+        )
+        self.node_status.grid(row=1, column=1, sticky="w", pady=5, padx=5)
+
+        # Webhook Status
+        ttk.Label(status_frame, text="Webhook URL:", font=("Arial", 11)).grid(
+            row=2, column=0, sticky="w", pady=5, padx=5
+        )
+
+        self.webhook_status = ttk.Label(
+            status_frame,
+            text="http://localhost:5000/webhook",
+            font=("Arial", 11),
+            foreground="blue"
+        )
+        self.webhook_status.grid(row=2, column=1, sticky="w", pady=5, padx=5)
 
         # QR Code Display
         qr_frame = ttk.LabelFrame(self.tab_dashboard, text="Código QR WhatsApp", padding=15)
-        qr_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        qr_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.qr_label = tk.Label(
+        self.qr_text = scrolledtext.ScrolledText(
             qr_frame,
-            text="Escanea el código QR cuando aparezca aquí...",
-            font=('Arial', 10),
-            wraplength=400
+            height=10,
+            wrap=tk.WORD,
+            font=("Consolas", 9)
         )
-        self.qr_label.pack(pady=20)
+        self.qr_text.pack(fill="both", expand=True, padx=5, pady=5)
+        self.qr_text.insert("1.0", "Escanea el código QR cuando aparezca aquí...\n\n")
+        self.qr_text.config(state="disabled")
 
     def setup_logs_tab(self):
         # Frame para logs con pestañas
         logs_notebook = ttk.Notebook(self.tab_logs)
-        logs_notebook.pack(fill='both', expand=True)
+        logs_notebook.pack(fill="both", expand=True)
 
         # Logs de Flask
         flask_log_frame = ttk.Frame(logs_notebook)
@@ -145,12 +211,9 @@ class BacanoBotGUI:
         self.flask_log = scrolledtext.ScrolledText(
             flask_log_frame,
             wrap=tk.WORD,
-            bg='black',
-            fg='white',
-            insertbackground='white',
-            font=('Consolas', 9)
+            font=("Consolas", 9)
         )
-        self.flask_log.pack(fill='both', expand=True, padx=5, pady=5)
+        self.flask_log.pack(fill="both", expand=True, padx=5, pady=5)
 
         # Logs de Node
         node_log_frame = ttk.Frame(logs_notebook)
@@ -159,141 +222,170 @@ class BacanoBotGUI:
         self.node_log = scrolledtext.ScrolledText(
             node_log_frame,
             wrap=tk.WORD,
-            bg='black',
-            fg='white',
-            insertbackground='white',
-            font=('Consolas', 9)
+            font=("Consolas", 9)
         )
-        self.node_log.pack(fill='both', expand=True, padx=5, pady=5)
+        self.node_log.pack(fill="both", expand=True, padx=5, pady=5)
 
         # Botones para logs
-        btn_frame = tk.Frame(self.tab_logs)
-        btn_frame.pack(fill='x', padx=10, pady=5)
+        btn_frame = ttk.Frame(self.tab_logs)
+        btn_frame.pack(fill="x", padx=10, pady=5)
 
-        tk.Button(
+        ttk.Button(
             btn_frame,
             text="📋 Copiar Logs",
             command=self.copy_logs
-        ).pack(side=tk.LEFT, padx=5)
+        ).pack(side="left", padx=5)
 
-        tk.Button(
+        ttk.Button(
             btn_frame,
             text="🧹 Limpiar Logs",
             command=self.clear_logs
-        ).pack(side=tk.LEFT, padx=5)
+        ).pack(side="left", padx=5)
 
     def setup_config_tab(self):
-        # Cargar configuración
-        config_frame = ttk.LabelFrame(self.tab_config, text="Configuración", padding=15)
-        config_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        # Frame principal
+        config_frame = ttk.Frame(self.tab_config)
+        config_frame.pack(fill="both", expand=True, padx=10, pady=10)
 
         # Configuración de Base de Datos
-        ttk.Label(config_frame, text="Host:").grid(row=0, column=0, sticky='w', pady=5)
-        self.host_entry = ttk.Entry(config_frame, width=30)
-        self.host_entry.grid(row=0, column=1, pady=5, padx=10)
+        db_frame = ttk.LabelFrame(config_frame, text="Configuración de Base de Datos", padding=10)
+        db_frame.pack(fill="x", pady=(0, 10))
 
-        ttk.Label(config_frame, text="Usuario:").grid(row=1, column=0, sticky='w', pady=5)
-        self.user_entry = ttk.Entry(config_frame, width=30)
-        self.user_entry.grid(row=1, column=1, pady=5, padx=10)
+        # Host
+        ttk.Label(db_frame, text="Host:").grid(row=0, column=0, sticky="w", pady=5)
+        self.host_entry = ttk.Entry(db_frame, width=40)
+        self.host_entry.grid(row=0, column=1, pady=5, padx=10, sticky="ew")
 
-        ttk.Label(config_frame, text="Contraseña:").grid(row=2, column=0, sticky='w', pady=5)
-        self.pass_entry = ttk.Entry(config_frame, width=30, show="*")
-        self.pass_entry.grid(row=2, column=1, pady=5, padx=10)
+        # Usuario
+        ttk.Label(db_frame, text="Usuario:").grid(row=1, column=0, sticky="w", pady=5)
+        self.user_entry = ttk.Entry(db_frame, width=40)
+        self.user_entry.grid(row=1, column=1, pady=5, padx=10, sticky="ew")
 
-        ttk.Label(config_frame, text="Base de Datos:").grid(row=3, column=0, sticky='w', pady=5)
-        self.db_entry = ttk.Entry(config_frame, width=30)
-        self.db_entry.grid(row=3, column=1, pady=5, padx=10)
+        # Contraseña
+        ttk.Label(db_frame, text="Contraseña:").grid(row=2, column=0, sticky="w", pady=5)
+        self.pass_entry = ttk.Entry(db_frame, width=40, show="*")
+        self.pass_entry.grid(row=2, column=1, pady=5, padx=10, sticky="ew")
+
+        # Base de Datos
+        ttk.Label(db_frame, text="Base de Datos:").grid(row=3, column=0, sticky="w", pady=5)
+        self.db_entry = ttk.Entry(db_frame, width=40)
+        self.db_entry.grid(row=3, column=1, pady=5, padx=10, sticky="ew")
+
+        db_frame.columnconfigure(1, weight=1)
 
         # Promociones
-        ttk.Label(config_frame, text="Promociones (una por línea):").grid(row=4, column=0, sticky='nw', pady=10)
-        self.promo_text = scrolledtext.ScrolledText(config_frame, width=40, height=10)
-        self.promo_text.grid(row=4, column=1, pady=10, padx=10)
+        promo_frame = ttk.LabelFrame(config_frame, text="Promociones (una por línea)", padding=10)
+        promo_frame.pack(fill="both", expand=True, pady=(10, 0))
+
+        self.promo_text = scrolledtext.ScrolledText(promo_frame, height=8)
+        self.promo_text.pack(fill="both", expand=True, padx=5, pady=5)
 
         # Botones
-        btn_frame = tk.Frame(config_frame)
-        btn_frame.grid(row=5, column=0, columnspan=2, pady=20)
+        btn_frame = ttk.Frame(config_frame)
+        btn_frame.pack(fill="x", pady=(10, 0))
 
-        tk.Button(
+        ttk.Button(
             btn_frame,
             text="💾 Guardar Configuración",
-            command=self.save_config,
-            bg='#007bff',
-            fg='white'
-        ).pack(side=tk.LEFT, padx=5)
+            command=self.save_config
+        ).pack(side="left", padx=5)
 
-        tk.Button(
+        ttk.Button(
             btn_frame,
             text="📤 Cargar Configuración",
-            command=self.load_config,
-            bg='#6c757d',
-            fg='white'
-        ).pack(side=tk.LEFT, padx=5)
+            command=self.load_config
+        ).pack(side="left", padx=5)
 
     def setup_database_tab(self):
+        # Frame principal
+        db_frame = ttk.Frame(self.tab_database)
+        db_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
         # Herramientas de BD
-        db_frame = ttk.LabelFrame(self.tab_database, text="Herramientas de Base de Datos", padding=15)
-        db_frame.pack(fill='both', expand=True, padx=10, pady=10)
+        tools_frame = ttk.LabelFrame(db_frame, text="Herramientas de Base de Datos", padding=15)
+        tools_frame.pack(fill="both", expand=True)
 
         # Botón de prueba de conexión
-        tk.Button(
-            db_frame,
+        ttk.Button(
+            tools_frame,
             text="🔍 Probar Conexión a BD",
             command=self.test_db_connection,
-            bg='#17a2b8',
-            fg='white',
-            font=('Arial', 10, 'bold')
-        ).pack(pady=10)
+            style="warning.TButton"
+        ).pack(pady=(0, 10))
 
         # Resultados de prueba
-        self.db_result = tk.Label(
-            db_frame,
+        self.db_result = ttk.Label(
+            tools_frame,
             text="",
-            font=('Arial', 10),
             wraplength=500
         )
-        self.db_result.pack(pady=10)
+        self.db_result.pack(pady=5)
+
+        # Separador
+        ttk.Separator(tools_frame, orient="horizontal").pack(fill="x", pady=20)
 
         # Buscar usuario
-        ttk.Label(db_frame, text="Buscar por DNI:").pack(pady=5)
-        self.search_dni = ttk.Entry(db_frame, width=20)
-        self.search_dni.pack(pady=5)
+        search_frame = ttk.Frame(tools_frame)
+        search_frame.pack(fill="x", pady=(0, 10))
 
-        tk.Button(
-            db_frame,
+        ttk.Label(search_frame, text="Buscar por DNI:").pack(side="left", padx=(0, 10))
+
+        self.search_dni = ttk.Entry(search_frame, width=20)
+        self.search_dni.pack(side="left", padx=(0, 10))
+
+        ttk.Button(
+            search_frame,
             text="👤 Buscar Usuario",
             command=self.search_user_by_dni
-        ).pack(pady=10)
+        ).pack(side="left")
 
         # Resultados de búsqueda
-        self.search_result = scrolledtext.ScrolledText(db_frame, width=60, height=10)
-        self.search_result.pack(pady=10)
+        self.search_result = scrolledtext.ScrolledText(tools_frame, height=8)
+        self.search_result.pack(fill="both", expand=True, pady=(10, 0))
 
     def load_config(self):
+        """Cargar configuración"""
         try:
-            with open('config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
+            # Importar dinámicamente para evitar errores
+            config_path = os.path.join(os.path.dirname(__file__), "config_manager.py")
 
-                # Cargar datos de BD
-                db = config.get('database', {})
-                self.host_entry.delete(0, tk.END)
-                self.host_entry.insert(0, db.get('host', ''))
-                self.user_entry.delete(0, tk.END)
-                self.user_entry.insert(0, db.get('user', ''))
-                self.pass_entry.delete(0, tk.END)
-                self.pass_entry.insert(0, db.get('password', ''))
-                self.db_entry.delete(0, tk.END)
-                self.db_entry.insert(0, db.get('database', ''))
+            if os.path.exists(config_path):
+                spec = importlib.util.spec_from_file_location("config_manager", config_path)
+                config_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(config_module)
 
-                # Cargar promociones
-                promotions = config.get('promotions', [])
-                self.promo_text.delete('1.0', tk.END)
-                self.promo_text.insert('1.0', '\n'.join(promotions))
+                config = config_module.load_config()
 
-                self.log("✅ Configuración cargada")
+                if config:
+                    # Cargar datos de BD
+                    db = config.get('database', {})
+                    self.host_entry.delete(0, tk.END)
+                    self.host_entry.insert(0, db.get('host', ''))
+                    self.user_entry.delete(0, tk.END)
+                    self.user_entry.insert(0, db.get('user', ''))
+                    self.pass_entry.delete(0, tk.END)
+                    self.pass_entry.insert(0, db.get('password', ''))
+                    self.db_entry.delete(0, tk.END)
+                    self.db_entry.insert(0, db.get('database', ''))
+
+                    # Cargar promociones
+                    promotions = config.get('promotions', [])
+                    self.promo_text.delete('1.0', tk.END)
+                    self.promo_text.insert('1.0', '\n'.join(promotions))
+
+                    self.log("✅ Configuración cargada")
+                else:
+                    self.log("⚠️ No se pudo cargar la configuración")
+            else:
+                self.log("❌ No se encontró config_manager.py")
+
         except Exception as e:
-            self.log(f"❌ Error cargando configuración: {e}")
+            error_msg = f"❌ Error cargando configuración: {str(e)}"
+            self.log(error_msg)
+            print(f"Error detallado: {traceback.format_exc()}")
 
     def save_config(self):
+        """Guardar configuración"""
         try:
             config = {
                 "database": {
@@ -302,34 +394,52 @@ class BacanoBotGUI:
                     "password": self.pass_entry.get(),
                     "database": self.db_entry.get()
                 },
-                "promotions": self.promo_text.get('1.0', tk.END).strip().split('\n')
+                "promotions": [p.strip() for p in self.promo_text.get('1.0', tk.END).strip().split('\n') if p.strip()]
             }
 
-            with open('config.json', 'w', encoding='utf-8') as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
+            # Importar dinámicamente
+            config_path = os.path.join(os.path.dirname(__file__), "config_manager.py")
 
-            self.log("✅ Configuración guardada")
-            messagebox.showinfo("Éxito", "Configuración guardada correctamente")
+            if os.path.exists(config_path):
+                spec = importlib.util.spec_from_file_location("config_manager", config_path)
+                config_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(config_module)
+
+                if config_module.save_config(config):
+                    self.log("✅ Configuración guardada")
+                    messagebox.showinfo("Éxito", "Configuración guardada correctamente")
+                else:
+                    self.log("❌ Error guardando configuración")
+                    messagebox.showerror("Error", "No se pudo guardar la configuración")
+            else:
+                self.log("❌ No se encontró config_manager.py")
+
         except Exception as e:
-            self.log(f"❌ Error guardando configuración: {e}")
-            messagebox.showerror("Error", f"Error: {e}")
+            error_msg = f"❌ Error guardando configuración: {str(e)}"
+            self.log(error_msg)
+            messagebox.showerror("Error", error_msg)
+            print(f"Error detallado: {traceback.format_exc()}")
 
     def start_all(self):
         """Iniciar todos los servicios"""
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+
         threading.Thread(target=self.start_flask, daemon=True).start()
+        time.sleep(2)  # Esperar a que Flask inicie
         threading.Thread(target=self.start_node, daemon=True).start()
+
+        self.log("🚀 Iniciando todos los servicios...")
 
     def start_flask(self):
         """Iniciar Flask backend"""
         try:
-            self.flask_status.config(text="🟡 Flask Backend - Iniciando...", fg='orange')
+            self.flask_status.config(text="🟡 Iniciando...", foreground="orange")
 
-            # Activar venv y ejecutar Flask
-            if os.name == 'nt':  # Windows
-                activate_cmd = os.path.join('venv', 'Scripts', 'activate')
-                cmd = f'cmd /c "{activate_cmd} && python python_backend/app.py"'
-            else:  # Linux/Mac
-                cmd = 'source venv/bin/activate && python python_backend/app.py'
+            # Comando para Flask
+            venv_python = "venv/Scripts/python.exe" if os.name == "nt" else "venv/bin/python"
+
+            cmd = f'"{venv_python}" "{os.path.join(os.path.dirname(__file__), "app.py")}"'
 
             self.flask_process = subprocess.Popen(
                 cmd,
@@ -338,66 +448,130 @@ class BacanoBotGUI:
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                bufsize=1,
+                universal_newlines=True
             )
 
+            self.is_flask_running = True
+            self.flask_status.config(text="🟢 Ejecutándose", foreground="green")
             self.log("🚀 Flask backend iniciado")
-            self.flask_status.config(text="🟢 Flask Backend - Ejecutándose", fg='green')
 
             # Leer output en tiempo real
-            for line in iter(self.flask_process.stdout.readline, ''):
-                if line:
-                    self.flask_queue.put(line)
+            def read_flask_output():
+                for line in iter(self.flask_process.stdout.readline, ''):
+                    if line:
+                        self.flask_queue.put(f"[FLASK] {line.strip()}")
+                self.flask_process.stdout.close()
+
+            threading.Thread(target=read_flask_output, daemon=True).start()
 
         except Exception as e:
-            self.log(f"❌ Error iniciando Flask: {e}")
-            self.flask_status.config(text="🔴 Flask Backend - Error", fg='red')
+            self.log(f"❌ Error iniciando Flask: {str(e)}")
+            self.flask_status.config(text="🔴 Error", foreground="red")
+            self.is_flask_running = False
 
     def start_node(self):
         """Iniciar WhatsApp bot"""
         try:
-            self.node_status.config(text="🟡 WhatsApp Bot - Iniciando...", fg='orange')
+            self.node_status.config(text="🟡 Iniciando...", foreground="orange")
 
-            cmd = 'node node_backend/index.js'
+            # Cambiar al directorio de node_backend
+            node_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "node_backend")
+
+            cmd = f'cd "{node_dir}" && node index.js'
+
             self.node_process = subprocess.Popen(
                 cmd,
                 shell=True,
-                cwd='node_backend',
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
-                errors='replace'
+                errors='replace',
+                bufsize=1,
+                universal_newlines=True
             )
 
+            self.is_node_running = True
+            self.node_status.config(text="🟢 Ejecutándose", foreground="green")
             self.log("🚀 WhatsApp bot iniciado")
-            self.node_status.config(text="🟢 WhatsApp Bot - Ejecutándose", fg='green')
 
             # Leer output en tiempo real
-            for line in iter(self.node_process.stdout.readline, ''):
-                if line:
-                    self.node_queue.put(line)
+            def read_node_output():
+                for line in iter(self.node_process.stdout.readline, ''):
+                    if line:
+                        self.node_queue.put(f"[WHATSAPP] {line.strip()}")
+                self.node_process.stdout.close()
+
+            threading.Thread(target=read_node_output, daemon=True).start()
 
         except Exception as e:
-            self.log(f"❌ Error iniciando Node: {e}")
-            self.node_status.config(text="🔴 WhatsApp Bot - Error", fg='red')
+            self.log(f"❌ Error iniciando Node: {str(e)}")
+            self.node_status.config(text="🔴 Error", foreground="red")
+            self.is_node_running = False
 
     def stop_all(self):
         """Detener todos los servicios"""
-        if self.flask_process:
-            self.flask_process.terminate()
-            self.flask_status.config(text="🔴 Flask Backend - Detenido", fg='red')
+        self.start_btn.config(state="normal")
+        self.stop_btn.config(state="disabled")
 
-        if self.node_process:
-            self.node_process.terminate()
-            self.node_status.config(text="🔴 WhatsApp Bot - Detenido", fg='red')
+        self.log("⏹️ Deteniendo todos los servicios...")
 
-        self.log("⏹️ Todos los servicios detenidos")
+        # Detener Node.js (WhatsApp)
+        if self.node_process and self.is_node_running:
+            try:
+                self.log("⏹️ Deteniendo WhatsApp bot...")
+                if os.name == 'nt':  # Windows
+                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.node_process.pid)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:  # Linux/Mac
+                    self.node_process.terminate()
+                    self.node_process.wait(timeout=3)
+            except Exception as e:
+                self.log(f"⚠️ Error deteniendo Node: {e}")
+                try:
+                    self.node_process.kill()
+                except:
+                    pass
+            finally:
+                self.is_node_running = False
+                self.node_status.config(text="🔴 Detenido", foreground="red")
+
+        # Detener Flask
+        if self.flask_process and self.is_flask_running:
+            try:
+                self.log("⏹️ Deteniendo Flask backend...")
+                if os.name == 'nt':  # Windows
+                    subprocess.call(['taskkill', '/F', '/T', '/PID', str(self.flask_process.pid)],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                else:  # Linux/Mac
+                    self.flask_process.terminate()
+                    self.flask_process.wait(timeout=3)
+            except Exception as e:
+                self.log(f"⚠️ Error deteniendo Flask: {e}")
+                try:
+                    self.flask_process.kill()
+                except:
+                    pass
+            finally:
+                self.is_flask_running = False
+                self.flask_status.config(text="🔴 Detenido", foreground="red")
+
+        # Limpiar colas
+        while not self.flask_queue.empty():
+            self.flask_queue.get()
+        while not self.node_queue.empty():
+            self.node_queue.get()
+
+        self.log("✅ Todos los servicios detenidos")
+        self.status_bar.config(text="⏹️ Servicios detenidos")
 
     def restart_all(self):
         """Reiniciar todos los servicios"""
         self.stop_all()
-        self.root.after(2000, self.start_all)
+        time.sleep(2)
+        self.start_all()
         self.log("🔄 Reiniciando servicios...")
 
     def update_logs(self):
@@ -405,24 +579,36 @@ class BacanoBotGUI:
         # Procesar logs de Flask
         while not self.flask_queue.empty():
             line = self.flask_queue.get()
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.flask_log.insert(tk.END, f"[{timestamp}] {line}")
+            self.flask_log.insert(tk.END, f"{line}\n")
             self.flask_log.see(tk.END)
 
             # Detectar QR code
-            if "QR" in line.upper() or "ESCANEA" in line.upper():
-                self.qr_label.config(text=f"📱 QR Detectado:\n{line}")
+            if "qr" in line.lower():
+                self.qr_text.config(state="normal")
+                self.qr_text.insert(tk.END, f"{line}\n")
+                self.qr_text.see(tk.END)
+                self.qr_text.config(state="disabled")
 
         # Procesar logs de Node
         while not self.node_queue.empty():
             line = self.node_queue.get()
-            timestamp = datetime.now().strftime("%H:%M:%S")
-            self.node_log.insert(tk.END, f"[{timestamp}] {line}")
+            self.node_log.insert(tk.END, f"{line}\n")
             self.node_log.see(tk.END)
 
             # Detectar QR code
-            if "QR" in line.upper():
-                self.qr_label.config(text=f"📱 QR Code Detectado:\n{line}")
+            if "qr" in line.lower():
+                self.qr_text.config(state="normal")
+                self.qr_text.insert(tk.END, f"{line}\n")
+                self.qr_text.see(tk.END)
+                self.qr_text.config(state="disabled")
+
+        # Actualizar barra de estado
+        if self.is_flask_running and self.is_node_running:
+            self.status_bar.config(text="🟢 Todos los servicios ejecutándose")
+        elif self.is_flask_running or self.is_node_running:
+            self.status_bar.config(text="🟡 Servicios parcialmente ejecutándose")
+        else:
+            self.status_bar.config(text="🔴 Servicios detenidos")
 
         # Programar siguiente actualización
         self.root.after(100, self.update_logs)
@@ -430,34 +616,42 @@ class BacanoBotGUI:
     def log(self, message):
         """Agregar mensaje a logs"""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.flask_log.insert(tk.END, f"[{timestamp}] {message}\n")
-        self.flask_log.see(tk.END)
+        formatted_message = f"[{timestamp}] {message}"
 
-        # Actualizar barra de estado
-        self.status_bar.config(text=f"📝 {message}")
+        self.flask_log.insert(tk.END, f"{formatted_message}\n")
+        self.flask_log.see(tk.END)
+        print(formatted_message)
+
+        # Actualizar barra de estado brevemente
+        self.status_bar.config(text=message)
+        self.root.after(5000, lambda: self.status_bar.config(
+            text="🟢 Ejecutándose" if self.is_flask_running and self.is_node_running else "🔴 Detenido"
+        ))
 
     def test_db_connection(self):
         """Probar conexión a base de datos"""
         try:
-            from python_backend.db_utils import get_connection
+            # Importar dinámicamente
+            db_utils_path = os.path.join(os.path.dirname(__file__), "db_utils.py")
 
-            conn = get_connection()
-            if conn:
-                self.db_result.config(
-                    text="✅ Conexión exitosa a la base de datos",
-                    fg='green'
-                )
-                conn.close()
+            if os.path.exists(db_utils_path):
+                spec = importlib.util.spec_from_file_location("db_utils", db_utils_path)
+                db_utils_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(db_utils_module)
+
+                conn = db_utils_module.get_connection()
+                if conn:
+                    self.db_result.config(text="✅ Conexión exitosa a la base de datos", foreground="green")
+                    conn.close()
+                else:
+                    self.db_result.config(text="❌ No se pudo conectar a la base de datos", foreground="red")
             else:
-                self.db_result.config(
-                    text="❌ No se pudo conectar a la base de datos",
-                    fg='red'
-                )
+                self.db_result.config(text="❌ No se encontró db_utils.py", foreground="red")
+
         except Exception as e:
-            self.db_result.config(
-                text=f"❌ Error: {str(e)}",
-                fg='red'
-            )
+            error_msg = f"❌ Error de conexión: {str(e)}"
+            self.db_result.config(text=error_msg, foreground="red")
+            print(f"Error detallado: {traceback.format_exc()}")
 
     def search_user_by_dni(self):
         """Buscar usuario por DNI"""
@@ -466,24 +660,34 @@ class BacanoBotGUI:
             return
 
         try:
-            from python_backend.db_utils import get_user_by_dni
+            # Importar dinámicamente
+            db_utils_path = os.path.join(os.path.dirname(__file__), "db_utils.py")
 
-            user = get_user_by_dni(dni)
-            self.search_result.delete('1.0', tk.END)
+            if os.path.exists(db_utils_path):
+                spec = importlib.util.spec_from_file_location("db_utils", db_utils_path)
+                db_utils_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(db_utils_module)
 
-            if user:
-                self.search_result.insert('1.0',
-                                          f"✅ Usuario encontrado:\n\n"
-                                          f"👤 Nombre: {user.get('nombre', 'N/A')}\n"
-                                          f"💰 Adelantos: {user.get('adelantos', 'N/A')}\n"
-                                          f"🔢 DNI: {dni}"
-                                          )
+                user = db_utils_module.get_user_by_dni(dni)
+                self.search_result.delete('1.0', tk.END)
+
+                if user:
+                    self.search_result.insert('1.0',
+                                              f"✅ Usuario encontrado:\n\n"
+                                              f"👤 Nombre: {user.get('nombre', 'N/A')}\n"
+                                              f"💰 Adelantos: {user.get('adelantos', 'N/A')}\n"
+                                              f"🔢 DNI: {dni}"
+                                              )
+                else:
+                    self.search_result.insert('1.0',
+                                              f"❌ No se encontró usuario con DNI: {dni}"
+                                              )
             else:
-                self.search_result.insert('1.0',
-                                          f"❌ No se encontró usuario con DNI: {dni}"
-                                          )
+                self.search_result.insert('1.0', "❌ No se encontró db_utils.py")
+
         except Exception as e:
             self.search_result.insert('1.0', f"❌ Error: {str(e)}")
+            print(f"Error detallado: {traceback.format_exc()}")
 
     def copy_logs(self):
         """Copiar logs al portapapeles"""
@@ -496,12 +700,23 @@ class BacanoBotGUI:
         """Limpiar todos los logs"""
         self.flask_log.delete('1.0', tk.END)
         self.node_log.delete('1.0', tk.END)
+        self.qr_text.config(state="normal")
+        self.qr_text.delete('1.0', tk.END)
+        self.qr_text.insert('1.0', "Escanea el código QR cuando aparezca aquí...\n\n")
+        self.qr_text.config(state="disabled")
         self.log("🧹 Logs limpiados")
 
 
 def main():
     root = tk.Tk()
     app = BacanoBotGUI(root)
+
+    # Manejar cierre de ventana
+    def on_closing():
+        app.stop_all()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_closing)
     root.mainloop()
 
 
