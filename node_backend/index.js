@@ -1,105 +1,112 @@
-import baileys from "@whiskeysockets/baileys"
-const {
-  default: makeWASocket,
-  useMultiFileAuthState,
-  DisconnectReason,
-  fetchLatestBaileysVersion
-} = baileys
+import makeWASocket, {
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    DisconnectReason
+} from "@whiskeysockets/baileys"
 
 import Pino from "pino"
 import { Boom } from "@hapi/boom"
 import fs from "fs"
-import qrcode from "qrcode"
+import qrcode from "qrcode-terminal"
 import axios from "axios"
-import { exec } from "child_process"
 
 const AUTH_FOLDER = "./whatsapp-sessions"
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
-  const { version } = await fetchLatestBaileysVersion()
 
-  console.log("Iniciando Baileys versión:", version)
+    console.log("🚀 Iniciando WhatsApp Bot con Baileys v7...")
 
-  const sock = makeWASocket({
-    version,
-    browser: ["Chrome (Linux)", "Chrome", "10.0.0"],
-    auth: state,
-    logger: Pino({ level: "silent" }),
-    printQRInTerminal: false
-  })
+    // --- Sesión ---
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER)
 
-  // =====================================
-  //               QR
-  // =====================================
-  sock.ev.on("connection.update", async (update) => {
-    const { connection, lastDisconnect, qr } = update
+    // --- Obtener versión oficial de WhatsApp ---
+    const { version } = await fetchLatestBaileysVersion()
+    console.log("📡 Version WA:", version)
 
-    if (qr) {
-      console.log("QR recibido. Generando imagen...")
+    // --- Crear socket ---
+    const sock = makeWASocket({
+        version,
+        logger: Pino({ level: "silent" }),
+        browser: ["Bacano-Bot", "Chrome", "1.0.0"],
+        auth: state,
+        printQRInTerminal: false,   // lo manejamos manualmente
+        syncFullHistory: false,     // recomendado
+        markOnlineOnConnect: true
+    })
 
-      const qrPath = "./qr.png"
+    // ============================================
+    //                  QR
+    // ============================================
+    sock.ev.on("connection.update", async (update) => {
+        const { connection, lastDisconnect, qr } = update
 
-      try {
-        await qrcode.toFile(qrPath, qr)
-        exec(`start "" "${qrPath}"`)
-        console.log("QR generado y abierto correctamente.")
-      } catch (err) {
-        console.log("Error generando QR:", err.message)
-      }
-    }
+        if (qr) {
+            console.log("📲 Escaneá este QR para vincular:")
+            qrcode.generate(qr, { small: true })
+        }
 
-    if (connection === "close") {
-      const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
+        // --- Desconexión ---
+        if (connection === "close") {
+            const reason = new Boom(lastDisconnect?.error)?.output?.statusCode
 
-      if (reason === DisconnectReason.loggedOut) {
-        console.log("Sesión cerrada. Reiniciando...")
-        fs.rmSync(AUTH_FOLDER, { recursive: true, force: true })
-        return startBot()
-      }
+            if (reason === DisconnectReason.loggedOut) {
+                console.log("❌ Sesión cerrada. Eliminando datos y reiniciando...")
+                fs.rmSync(AUTH_FOLDER, { recursive: true, force: true })
+                return startBot()
+            }
 
-      console.log("Conexión perdida. Reintentando...")
-      return startBot()
-    }
+            console.log("⚠️ Conexión perdida. Reintentando...")
+            return startBot()
+        }
 
-    if (connection === "open") {
-      console.log("Conectado a WhatsApp correctamente.")
-    }
-  })
+        if (connection === "open") {
+            console.log("✅ Conectado a WhatsApp correctamente.")
+        }
+    })
 
-  sock.ev.on("creds.update", saveCreds)
+    // Guardar credenciales cuando se actualizan
+    sock.ev.on("creds.update", saveCreds)
 
-  // =====================================
-  //          MENSAJES
-  // =====================================
-  sock.ev.on("messages.upsert", async ({ messages }) => {
-    const msg = messages[0]
-    if (!msg.message || msg.key.fromMe) return
+    // ============================================
+    //              RECEPCIÓN DE MENSAJES
+    // ============================================
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+        const msg = messages[0]
+        if (!msg.message || msg.key.fromMe) return
 
-    const from = msg.key.remoteJid
-    const text =
-      msg.message.conversation ||
-      msg.message.extendedTextMessage?.text ||
-      null
+        const from = msg.key.remoteJid
+        const text =
+            msg.message.conversation ||
+            msg.message.extendedTextMessage?.text ||
+            null
 
-    if (!text) return
+        if (!text) return
 
-    console.log(`Mensaje recibido de ${from}: ${text}`)
+        console.log(`💬 Mensaje recibido de ${from}: "${text}"`)
 
-    try {
-      const response = await axios.post(
-        "http://localhost:5000/webhook",
-        { from, message: text },
-        { timeout: 15000 }
-      )
+        // --- Enviar al backend Python ---
+        try {
+            const webhookData = { from, message: text }
 
-      if (response.data?.reply) {
-        await sock.sendMessage(from, { text: response.data.reply })
-      }
-    } catch (err) {
-      console.error("Error webhook:", err.message)
-    }
-  })
+            const resp = await axios.post(
+                "http://localhost:5000/webhook",
+                webhookData,
+                { timeout: 10000 }
+            )
+
+            if (resp.data?.reply) {
+                await sock.sendMessage(from, { text: resp.data.reply })
+                console.log("📨 Respuesta enviada.")
+            }
+
+        } catch (err) {
+            console.error("❌ Error webhook:", err.message)
+            try {
+                await sock.sendMessage(from, { text: "⚠️ Error del servidor. Intenta más tarde." })
+            } catch {}
+        }
+    })
 }
 
-startBot().catch((err) => console.error("Error general:", err))
+// --- Iniciar ---
+startBot().catch(err => console.error("❌ Error fatal:", err))
