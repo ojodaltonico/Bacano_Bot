@@ -273,7 +273,7 @@ class BalanceLoadService:
                     server_now_str,
                     client_id,
                     "BOT",
-                    "MERCADO PAGO",
+                    "TARJETA",
                     formatted_amount,
                 ),
             )
@@ -297,7 +297,7 @@ class BalanceLoadService:
                     client_id,
                     "BOT",
                     "RECARGA",
-                    "RECARGA MERCADO PAGO BOT",
+                    "RECARGA TARJETA BOT",
                     "-",
                     "-",
                     formatted_amount,
