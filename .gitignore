@@ -43,11 +43,13 @@ __pycache__/
 # 🔹 Logs
 # ============================
 *.log
+python_backend/logs/
 
 # ============================
 # 🔹 Debug outputs de Python
 # ============================
 python_backend/debug/
+python_backend/data/*.sqlite
 
 # ============================
 # 🔹 Dist / build
