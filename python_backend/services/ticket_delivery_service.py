@@ -9,7 +9,7 @@ from bs4 import BeautifulSoup
 
 from config_manager import load_config
 from integrations.tickera_client import TickeraClient
-from integrations.woocommerce_client import WooCommerceClient
+from integrations.woocommerce_client import WooCommerceAPIError, WooCommerceClient
 
 
 REQUEST_TIMEOUT = 30
@@ -29,7 +29,19 @@ class TicketDeliveryService:
         self._wordpress_password: str | None = None
 
     def get_order_delivery_info(self, order_id: int) -> dict[str, Any]:
-        order = self._get_order(order_id)
+        try:
+            order = self._get_order(order_id)
+        except WooCommerceAPIError as exc:
+            if "HTTP 404" in str(exc):
+                return self._build_delivery_info_response(
+                    order_id=order_id,
+                    ready=False,
+                    ready_to_send=False,
+                    reason=f"No existe un pedido WooCommerce con ID {order_id}.",
+                    not_ready_reasons=["order_not_found"],
+                )
+            raise
+
         billing = order.get("billing") or {}
         line_items = order.get("line_items") or []
         expected_tickets = sum(
@@ -51,6 +63,36 @@ class TicketDeliveryService:
 
         is_mercado_pago = payment_method == "woo-mercado-pago-custom"
         is_cash = payment_method == "cod"
+        not_ready_reasons: list[str] = []
+        reason = None
+
+        if is_cash:
+            not_ready_reasons.append("payment_method_not_allowed")
+            reason = "Pedido en efectivo / RRPP. No se envia automaticamente."
+        elif not is_mercado_pago:
+            not_ready_reasons.append("payment_method_not_allowed")
+            reason = "Metodo de pago no habilitado para envio automatico."
+
+        if status not in {"processing", "completed"}:
+            not_ready_reasons.append("status_not_ready")
+            if reason is None:
+                reason = f"Estado del pedido no habilitado: {status}."
+
+        if date_paid is None:
+            not_ready_reasons.append("payment_not_confirmed")
+            if reason is None:
+                reason = "Pago todavia no confirmado."
+
+        if needs_payment:
+            not_ready_reasons.append("still_needs_payment")
+            if reason is None:
+                reason = "El pedido todavia necesita pago."
+
+        if not billing_phone:
+            not_ready_reasons.append("missing_phone")
+            if reason is None:
+                reason = "El pedido no tiene telefono de facturacion."
+
         ready_to_send = (
             is_mercado_pago
             and status in {"processing", "completed"}
@@ -60,20 +102,26 @@ class TicketDeliveryService:
         )
 
         return {
+            "ready": ready_to_send,
+            "ready_to_send": ready_to_send,
             "order_id": order.get("id"),
+            "reason": None if ready_to_send else (reason or "El pedido no esta listo para enviar."),
+            "not_ready_reasons": not_ready_reasons,
             "status": status,
             "date_paid": date_paid,
+            "needs_payment": needs_payment,
             "payment_method": payment_method,
             "payment_method_title": order.get("payment_method_title"),
             "billing_phone": billing_phone,
+            "phone_present": bool(billing_phone),
             "billing_email": str(billing.get("email") or "").strip(),
             "billing_first_name": str(billing.get("first_name") or "").strip(),
             "billing_last_name": str(billing.get("last_name") or "").strip(),
             "expected_tickets": expected_tickets,
+            "products": product_names,
             "product_names": product_names,
             "is_mercado_pago": is_mercado_pago,
             "is_cash": is_cash,
-            "ready_to_send": ready_to_send,
         }
 
     def get_ticket_download_links(self, order_id: int) -> list[dict[str, Any]]:
@@ -96,8 +144,17 @@ class TicketDeliveryService:
         self, order_id: int, destination_dir: str | Path
     ) -> dict[str, Any]:
         delivery_info = self.get_order_delivery_info(order_id)
-        if not delivery_info["ready_to_send"]:
-            return {"ready": False, "reason": "El pedido no esta listo para enviar."}
+        if not delivery_info.get("ready_to_send", False):
+            return self._build_not_ready_response(
+                order_id=order_id,
+                reason=delivery_info.get("reason") or "El pedido no esta listo para enviar.",
+                not_ready_reasons=delivery_info.get("not_ready_reasons") or [],
+                status=delivery_info.get("status"),
+                payment_method=delivery_info.get("payment_method"),
+                date_paid=delivery_info.get("date_paid"),
+                needs_payment=delivery_info.get("needs_payment"),
+                billing_phone_present=bool(delivery_info.get("billing_phone")),
+            )
 
         expected_tickets = int(delivery_info["expected_tickets"])
         try:
@@ -105,17 +162,32 @@ class TicketDeliveryService:
                 order_id, destination_dir
             )
         except RuntimeError as exc:
-            return {"ready": False, "reason": str(exc)}
+            return self._build_not_ready_response(
+                order_id=order_id,
+                reason=str(exc),
+                not_ready_reasons=delivery_info.get("not_ready_reasons") or [],
+                status=delivery_info.get("status"),
+                payment_method=delivery_info.get("payment_method"),
+                date_paid=delivery_info.get("date_paid"),
+                needs_payment=delivery_info.get("needs_payment"),
+                billing_phone_present=bool(delivery_info.get("billing_phone")),
+            )
 
         found_tickets = len(downloaded_tickets)
         if found_tickets < expected_tickets:
-            return {
-                "ready": False,
-                "reason": (
+            return self._build_not_ready_response(
+                order_id=order_id,
+                reason=(
                     "Se encontraron menos tickets de los esperados "
                     f"({found_tickets}/{expected_tickets})."
                 ),
-            }
+                not_ready_reasons=delivery_info.get("not_ready_reasons") or [],
+                status=delivery_info.get("status"),
+                payment_method=delivery_info.get("payment_method"),
+                date_paid=delivery_info.get("date_paid"),
+                needs_payment=delivery_info.get("needs_payment"),
+                billing_phone_present=bool(delivery_info.get("billing_phone")),
+            )
 
         customer_name = " ".join(
             part
@@ -136,6 +208,87 @@ class TicketDeliveryService:
             "ticket_pdfs": downloaded_tickets,
             "pdf_files": [ticket["pdf_path"] for ticket in downloaded_tickets],
             "reason": None,
+            "not_ready_reasons": [],
+            "status": delivery_info.get("status"),
+            "payment_method": delivery_info.get("payment_method"),
+            "date_paid": delivery_info.get("date_paid"),
+            "needs_payment": delivery_info.get("needs_payment"),
+            "billing_phone_present": bool(delivery_info.get("billing_phone")),
+        }
+
+    @staticmethod
+    def _build_delivery_info_response(
+        order_id: int,
+        ready: bool = False,
+        ready_to_send: bool = False,
+        reason: str | None = None,
+        not_ready_reasons: list[str] | None = None,
+        status: str | None = None,
+        payment_method: str | None = None,
+        payment_method_title: str | None = None,
+        date_paid: Any = None,
+        needs_payment: bool | None = None,
+        billing_phone: str | None = None,
+        expected_tickets: int = 0,
+        products: list[str] | None = None,
+        billing_email: str | None = None,
+        billing_first_name: str | None = None,
+        billing_last_name: str | None = None,
+        is_mercado_pago: bool = False,
+        is_cash: bool = False,
+    ) -> dict[str, Any]:
+        product_list = products or []
+        phone_value = billing_phone if billing_phone else None
+        return {
+            "ready": ready,
+            "ready_to_send": ready_to_send,
+            "order_id": order_id,
+            "reason": reason,
+            "not_ready_reasons": not_ready_reasons or [],
+            "status": status,
+            "payment_method": payment_method,
+            "payment_method_title": payment_method_title,
+            "date_paid": date_paid,
+            "needs_payment": needs_payment,
+            "billing_phone": phone_value,
+            "phone_present": bool(phone_value),
+            "expected_tickets": expected_tickets,
+            "products": product_list,
+            "product_names": product_list,
+            "billing_email": billing_email or "",
+            "billing_first_name": billing_first_name or "",
+            "billing_last_name": billing_last_name or "",
+            "is_mercado_pago": is_mercado_pago,
+            "is_cash": is_cash,
+        }
+
+    @staticmethod
+    def _build_not_ready_response(
+        order_id: int,
+        reason: str,
+        not_ready_reasons: list[str] | None = None,
+        status: str | None = None,
+        payment_method: str | None = None,
+        date_paid: Any = None,
+        needs_payment: bool | None = None,
+        billing_phone_present: bool | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "ready": False,
+            "ready_to_send": False,
+            "order_id": order_id,
+            "reason": reason,
+            "not_ready_reasons": not_ready_reasons or [],
+            "status": status,
+            "payment_method": payment_method,
+            "payment_method_title": None,
+            "date_paid": date_paid,
+            "needs_payment": needs_payment,
+            "billing_phone": None,
+            "billing_phone_present": billing_phone_present,
+            "phone_present": bool(billing_phone_present),
+            "expected_tickets": 0,
+            "products": [],
         }
 
     def _download_ticket_pdf_records(
