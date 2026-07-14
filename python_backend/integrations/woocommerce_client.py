@@ -78,6 +78,26 @@ class WooCommerceClient:
             raise ValueError("order_id es requerido para consultar un pedido.")
         return self._get(f"/wp-json/wc/v3/orders/{order_id}")
 
+    def create_order(self, payload: Dict[str, Any]) -> Any:
+        if not isinstance(payload, dict):
+            raise ValueError("payload debe ser un dict para crear un pedido.")
+        return self._post("/wp-json/wc/v3/orders", json_payload=payload, expected_status=201)
+
+    def create_order_note(self, order_id: int, note: str, customer_note: bool = False) -> Any:
+        if not order_id:
+            raise ValueError("order_id es requerido para crear una nota.")
+        if not str(note or "").strip():
+            raise ValueError("note es requerida para crear una nota.")
+        payload = {
+            "note": str(note).strip(),
+            "customer_note": bool(customer_note),
+        }
+        return self._post(
+            f"/wp-json/wc/v3/orders/{order_id}/notes",
+            json_payload=payload,
+            expected_status=201,
+        )
+
     def _get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         url = f"{self.base_url}{path}"
 
@@ -94,6 +114,39 @@ class WooCommerceClient:
             ) from exc
 
         if response.status_code != 200:
+            message = self._extract_error_message(response)
+            raise WooCommerceAPIError(
+                f"WooCommerce devolvio HTTP {response.status_code} en '{path}'. {message}"
+            )
+
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise WooCommerceAPIError(
+                f"WooCommerce devolvio una respuesta no JSON en '{path}'."
+            ) from exc
+
+    def _post(
+        self,
+        path: str,
+        json_payload: Dict[str, Any],
+        expected_status: int,
+    ) -> Any:
+        url = f"{self.base_url}{path}"
+
+        try:
+            response = requests.post(
+                url,
+                json=json_payload,
+                auth=self._auth,
+                timeout=self._timeout,
+            )
+        except requests.RequestException as exc:
+            raise WooCommerceAPIError(
+                f"Error enviando datos a WooCommerce en '{path}': {exc}"
+            ) from exc
+
+        if response.status_code != expected_status:
             message = self._extract_error_message(response)
             raise WooCommerceAPIError(
                 f"WooCommerce devolvio HTTP {response.status_code} en '{path}'. {message}"
