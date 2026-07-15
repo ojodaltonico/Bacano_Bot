@@ -5,29 +5,31 @@ import sys
 from services.balance_order_service import BalanceOrderService
 
 
-def parse_args(argv: list[str]) -> dict[str, str | bool]:
-    if len(argv) not in {5, 6}:
-        raise SystemExit(
-            "Uso: python python_backend/test_create_balance_order.py DNI IMPORTE EMAIL TELEFONO | "
-            "python python_backend/test_create_balance_order.py DNI IMPORTE EMAIL TELEFONO --commit"
-        )
+def parse_args(argv: list[str]) -> dict[str, str | bool | None]:
+    args = list(argv[1:])
+    commit = False
+    if args and args[-1] == "--commit":
+        commit = True
+        args = args[:-1]
 
-    dni = str(argv[1]).strip()
-    amount = str(argv[2]).strip()
-    email = str(argv[3]).strip()
-    phone = str(argv[4]).strip()
-    commit = len(argv) == 6 and argv[5] == "--commit"
-
-    if len(argv) == 6 and not commit:
+    if len(args) == 3:
+        dni, amount, phone = args
+        email = None
+    elif len(args) == 4:
+        # Compatibilidad temporal con la forma anterior:
+        # DNI IMPORTE EMAIL TELEFONO
+        dni, amount, email, phone = args
+    else:
         raise SystemExit(
-            "La unica opcion adicional permitida es --commit."
+            "Uso: python python_backend/test_create_balance_order.py DNI IMPORTE TELEFONO [--commit]\n"
+            "Compatibilidad: python python_backend/test_create_balance_order.py DNI IMPORTE EMAIL TELEFONO [--commit]"
         )
 
     return {
-        "dni": dni,
-        "amount": amount,
-        "email": email,
-        "phone": phone,
+        "dni": str(dni).strip(),
+        "amount": str(amount).strip(),
+        "email": str(email).strip() if email else None,
+        "phone": str(phone).strip(),
         "commit": commit,
     }
 
@@ -37,7 +39,10 @@ def print_preview(preview: dict[str, object], simulation: bool) -> None:
     print(f"DNI: {preview['dni_masked']}")
     print(f"ID interno: {preview['client_id']}")
     print(f"Importe: {preview['amount_display']}")
-    print(f"Correo: {preview['email']}")
+    if preview.get("email"):
+        print(f"Correo: {preview['email']}")
+    else:
+        print("Correo: no informado (pedido invitado)")
     print(f"Telefono: {preview['phone_masked']}")
     if simulation:
         print("MODO SIMULACION - NO SE CREO NINGUN PEDIDO")
@@ -51,8 +56,8 @@ def main() -> None:
         preview = service.preview_order(
             str(options["dni"]),
             str(options["amount"]),
-            str(options["email"]),
             str(options["phone"]),
+            email=str(options["email"]) if options["email"] else None,
         )
     except Exception as exc:
         print(str(exc) or "No se pudo preparar la vista previa.")
@@ -85,9 +90,9 @@ def main() -> None:
     result = service.create_order(
         str(options["dni"]),
         str(options["amount"]),
-        str(options["email"]),
         str(options["phone"]),
         int(preview["client_id"]),
+        email=str(options["email"]) if options["email"] else None,
     )
     if not result.get("ok"):
         print(str(result.get("message") or "No se pudo crear el pedido."))
