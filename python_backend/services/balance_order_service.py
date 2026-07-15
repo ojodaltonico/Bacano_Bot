@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from integrations.woocommerce_client import WooCommerceAPIError, WooCommerceClient
-from services.balance_load_service import BalanceLoadService, BalanceLoadError
+from services.balance_load_service import BalanceLoadService
 from services.delivery_state_service import DB_PATH
 from utils.phone_utils import mask_phone, normalize_argentine_phone
 
@@ -27,8 +27,14 @@ class BalanceOrderService:
         self._init_sqlite()
         self._created_request_keys: set[tuple[str, str, str, str]] = set()
 
-    def preview_order(self, dni: str, amount: str, email: str, phone: str) -> dict[str, Any]:
-        email = self._validate_email(email)
+    def preview_order(
+        self,
+        dni: str,
+        amount: str,
+        phone: str,
+        email: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_email = self._validate_optional_email(email)
         normalized_phone = self._validate_phone(phone)
 
         preview = self._balance_load_service.preview_load(dni, amount)
@@ -40,7 +46,6 @@ class BalanceOrderService:
                 "client_ids": preview.get("client_ids", []),
             }
 
-        client = preview["client"]
         name = str(preview.get("name") or "").strip()
         first_name, last_name = self._split_name(name)
         amount_decimal = self._parse_formatted_amount(str(preview["amount"]))
@@ -52,7 +57,7 @@ class BalanceOrderService:
             "dni_masked": self._mask_dni(str(dni)),
             "amount_decimal": f"{amount_decimal:.2f}",
             "amount_display": str(preview["amount"]),
-            "email": email,
+            "email": normalized_email,
             "phone_masked": mask_phone(normalized_phone),
             "phone_normalized": normalized_phone,
             "first_name": first_name,
@@ -65,11 +70,11 @@ class BalanceOrderService:
         self,
         dni: str,
         amount: str,
-        email: str,
         phone: str,
         confirmed_client_id: int,
+        email: str | None = None,
     ) -> dict[str, Any]:
-        preview = self.preview_order(dni, amount, email, phone)
+        preview = self.preview_order(dni, amount, phone, email=email)
         if not preview.get("ok"):
             return {
                 "ok": False,
@@ -88,7 +93,7 @@ class BalanceOrderService:
         request_key = (
             self._normalize_dni(dni),
             str(preview["amount_decimal"]),
-            str(preview["email"]).strip().lower(),
+            str(preview.get("email") or "").strip().lower(),
             str(preview["phone_normalized"]),
         )
         if request_key in self._created_request_keys:
@@ -98,18 +103,21 @@ class BalanceOrderService:
                 "message": "La misma ejecucion ya intento crear este pedido en este proceso.",
             }
 
+        billing = {
+            "first_name": preview["first_name"],
+            "last_name": preview["last_name"],
+            "phone": preview["phone_normalized"],
+            "country": "AR",
+        }
+        if preview.get("email"):
+            billing["email"] = preview["email"]
+
         payload = {
             "status": "pending",
             "set_paid": False,
             "payment_method": "",
             "payment_method_title": "",
-            "billing": {
-                "first_name": preview["first_name"],
-                "last_name": preview["last_name"],
-                "email": preview["email"],
-                "phone": preview["phone_normalized"],
-                "country": "AR",
-            },
+            "billing": billing,
             "fee_lines": [
                 {
                     "name": "Carga de saldo Bacano",
@@ -131,7 +139,7 @@ class BalanceOrderService:
         note_text = (
             "Carga de saldo solicitada desde Bacano Bot.\n"
             f"Cliente interno: {client_id}.\n"
-            "Pendiente de acreditación luego de confirmar el pago."
+            "Pendiente de acreditacion luego de confirmar el pago."
         )
 
         try:
@@ -146,17 +154,16 @@ class BalanceOrderService:
                 customer_note=False,
             )
             payment_url = self._resolve_payment_url(created_order)
-            created_at = self._now_iso()
             self._insert_balance_order(
                 woocommerce_order_id=order_id,
                 client_id=client_id,
                 dni_last4=self._last4(self._normalize_dni(dni)),
                 amount=str(preview["amount_decimal"]),
-                email=str(preview["email"]),
+                email=preview.get("email"),
                 phone_masked=str(preview["phone_masked"]),
                 status="awaiting_payment",
                 payment_url=payment_url,
-                created_at=created_at,
+                created_at=self._now_iso(),
                 paid_at=None,
                 credited_at=None,
                 last_error=None,
@@ -241,8 +248,10 @@ class BalanceOrderService:
         return parts[0], " ".join(parts[1:])
 
     @staticmethod
-    def _validate_email(email: str) -> str:
+    def _validate_optional_email(email: str | None) -> str | None:
         normalized = str(email or "").strip()
+        if not normalized:
+            return None
         if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", normalized):
             raise BalanceOrderError("El correo es invalido.")
         return normalized
@@ -315,7 +324,7 @@ class BalanceOrderService:
         client_id: int,
         dni_last4: str,
         amount: str,
-        email: str,
+        email: str | None,
         phone_masked: str,
         status: str,
         payment_url: str,
