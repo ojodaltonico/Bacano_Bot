@@ -177,6 +177,35 @@ class BalanceOrderService:
                 "message": str(exc),
             }
 
+    def get_local_order(self, order_id: int) -> dict[str, Any] | None:
+        with self._connect_sqlite() as conn:
+            row = conn.execute(
+                "SELECT * FROM balance_orders WHERE woocommerce_order_id = ?",
+                (order_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_local_order_status(
+        self,
+        order_id: int,
+        *,
+        status: str,
+        paid_at: str | None = None,
+        last_error: str | None = None,
+    ) -> None:
+        with self._connect_sqlite() as conn:
+            conn.execute(
+                """
+                UPDATE balance_orders
+                SET status = ?,
+                    paid_at = COALESCE(?, paid_at),
+                    last_error = ?
+                WHERE woocommerce_order_id = ?
+                """,
+                (status, paid_at, last_error, order_id),
+            )
+            conn.commit()
+
     def _resolve_payment_url(self, created_order: dict[str, Any]) -> str:
         payment_url = str(created_order.get("payment_url") or "").strip()
         if payment_url:
