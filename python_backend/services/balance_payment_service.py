@@ -40,6 +40,7 @@ class BalancePaymentService:
             return {
                 "ok": False,
                 "message": validation["message"],
+                "tickera_diagnostics": validation.get("tickera_diagnostics"),
             }
 
         client_id = int(meta["_bacano_client_id"])
@@ -76,7 +77,7 @@ class BalancePaymentService:
         local_status = self._resolve_local_status(local_order, local_load)
 
         preview = None
-        if can_credit:
+        if not credited:
             preview_result = self._balance_load_service.preview_load(
                 client_lookup["dni"],
                 amount_decimal,
@@ -102,14 +103,21 @@ class BalancePaymentService:
             can_credit=can_credit,
             reason=paid_eval["reason"],
             preview=preview,
+            contains_tickera=bool(validation.get("contains_tickera")),
+            tickera_diagnostics=validation.get("tickera_diagnostics"),
         )
 
     def _validate_balance_order(self, order: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
+        tickera_analysis = self._analyze_tickera_evidence(order, meta)
         if not isinstance(order, dict) or not order.get("id"):
-            return {"ok": False, "message": "El pedido no existe."}
+            return {"ok": False, "message": "El pedido no existe.", "tickera_diagnostics": tickera_analysis}
 
         if meta.get("_bacano_operation_type") != "balance_load":
-            return {"ok": False, "message": "El pedido no es una carga de saldo valida."}
+            return {
+                "ok": False,
+                "message": "El pedido no es una carga de saldo valida.",
+                "tickera_diagnostics": tickera_analysis,
+            }
 
         for key in (
             "_bacano_client_id",
@@ -117,18 +125,24 @@ class BalancePaymentService:
             "_bacano_balance_status",
         ):
             if not str(meta.get(key) or "").strip():
-                return {"ok": False, "message": f"Falta metadata requerida: {key}"}
+                return {
+                    "ok": False,
+                    "message": f"Falta metadata requerida: {key}",
+                    "tickera_diagnostics": tickera_analysis,
+                }
 
         if order.get("line_items"):
             return {
                 "ok": False,
-                "message": "El pedido contiene line_items y no parece un pedido puro de carga de saldo.",
+                "message": "El pedido de carga tiene line_items reales y es inconsistente.",
+                "tickera_diagnostics": tickera_analysis,
             }
 
-        if self._looks_like_tickera(order, meta):
+        if tickera_analysis["contains_tickera"]:
             return {
                 "ok": False,
-                "message": "El pedido contiene indicadores de Tickera.",
+                "message": "El pedido contiene evidencia concreta de Tickera.",
+                "tickera_diagnostics": tickera_analysis,
             }
 
         total = str(order.get("total") or "").strip()
@@ -137,9 +151,15 @@ class BalancePaymentService:
             return {
                 "ok": False,
                 "message": "El total del pedido no coincide con _bacano_balance_amount.",
+                "tickera_diagnostics": tickera_analysis,
             }
 
-        return {"ok": True, "message": None}
+        return {
+            "ok": True,
+            "message": None,
+            "contains_tickera": False,
+            "tickera_diagnostics": tickera_analysis,
+        }
 
     def _evaluate_paid_status(self, order: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
         status = str(order.get("status") or "")
@@ -151,7 +171,7 @@ class BalancePaymentService:
         if status in {"failed", "cancelled", "refunded"}:
             return {"paid": False, "reason": f"Estado WooCommerce no valido: {status}."}
         if status == "pending":
-            return {"paid": False, "reason": "El pedido sigue pending."}
+            return {"paid": False, "reason": "El pedido todavia requiere pago."}
         if status == "on-hold" and not date_paid:
             return {"paid": False, "reason": "El pedido esta on-hold sin date_paid."}
         if status not in {"processing", "completed"}:
@@ -182,6 +202,8 @@ class BalancePaymentService:
         can_credit: bool,
         reason: str | None,
         preview: dict[str, Any] | None,
+        contains_tickera: bool,
+        tickera_diagnostics: dict[str, Any] | None,
     ) -> dict[str, Any]:
         return {
             "ok": True,
@@ -198,6 +220,8 @@ class BalancePaymentService:
             "reason": reason,
             "preview": preview,
             "reference": f"WC-BALANCE-{int(order.get('id') or 0)}",
+            "contains_tickera": contains_tickera,
+            "tickera_diagnostics": tickera_diagnostics,
         }
 
     @staticmethod
@@ -215,20 +239,69 @@ class BalancePaymentService:
         return result
 
     @staticmethod
-    def _looks_like_tickera(order: dict[str, Any], meta: dict[str, str]) -> bool:
-        if order.get("line_items"):
-            for item in order.get("line_items") or []:
-                name = str(item.get("name") or "").lower()
-                if "ticket" in name or "entrada" in name:
-                    return True
-        for key, value in meta.items():
+    def _analyze_tickera_evidence(order: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
+        evidence: list[str] = []
+        line_items_summary: list[dict[str, Any]] = []
+        for item in order.get("line_items") or []:
+            item_meta_keys: list[str] = []
+            for meta_item in item.get("meta_data") or []:
+                if isinstance(meta_item, dict):
+                    key = str(meta_item.get("key") or "").strip()
+                    if key:
+                        item_meta_keys.append(key)
+
+            product_id = item.get("product_id")
+            variation_id = item.get("variation_id")
+            name = str(item.get("name") or "").strip()
+            line_items_summary.append(
+                {
+                    "id": item.get("id"),
+                    "name": name,
+                    "product_id": product_id,
+                    "variation_id": variation_id,
+                    "meta_keys": item_meta_keys,
+                }
+            )
+
+            for meta_key in item_meta_keys:
+                lowered_key = meta_key.lower()
+                if lowered_key.startswith("tc_"):
+                    evidence.append(f"line_item_meta:{meta_key}")
+                elif lowered_key in {
+                    "ticket type",
+                    "event",
+                    "ticket instance",
+                    "ticket_instance",
+                    "download_ticket",
+                }:
+                    evidence.append(f"line_item_meta:{meta_key}")
+                elif "ticket_type" in lowered_key or "ticket_instance" in lowered_key:
+                    evidence.append(f"line_item_meta:{meta_key}")
+
+        fee_lines_summary = [
+            {
+                "id": item.get("id"),
+                "name": str(item.get("name") or "").strip(),
+                "total": item.get("total"),
+                "tax_status": item.get("tax_status"),
+            }
+            for item in (order.get("fee_lines") or [])
+            if isinstance(item, dict)
+        ]
+
+        order_meta_keys_matching = []
+        for key in meta.keys():
             lowered_key = key.lower()
-            lowered_value = str(value or "").lower()
-            if "tickera" in lowered_key or lowered_key.startswith("tc_"):
-                return True
-            if "tickera" in lowered_value:
-                return True
-        return False
+            if lowered_key.startswith("tc_") or "tickera" in lowered_key or "ticket" in lowered_key:
+                order_meta_keys_matching.append(key)
+
+        return {
+            "contains_tickera": bool(evidence),
+            "evidence": evidence,
+            "line_items": line_items_summary,
+            "fee_lines": fee_lines_summary,
+            "order_meta_keys_matching": order_meta_keys_matching,
+        }
 
     @staticmethod
     def _same_decimal_amount(order_total: str, metadata_amount: str) -> bool:
@@ -334,4 +407,3 @@ class BalancePaymentService:
             status="awaiting_payment",
             last_error=None,
         )
-
