@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-import sqlite3
 from typing import Any
 
+from config_manager import load_config
 from integrations.woocommerce_client import WooCommerceAPIError, WooCommerceClient
 from services.balance_load_service import BalanceLoadService
 from services.balance_order_service import BalanceOrderService
+
+
+MERCADO_PAGO_METHOD = "woo-mercado-pago-custom"
 
 
 class BalancePaymentService:
@@ -14,15 +16,21 @@ class BalancePaymentService:
         self._woocommerce_client = WooCommerceClient()
         self._balance_order_service = BalanceOrderService()
         self._balance_load_service = BalanceLoadService()
+        config = load_config()
+        notifications = config.get("admin_notifications", {}) if isinstance(config, dict) else {}
+        self._admin_phone = str(notifications.get("phone") or "").strip()
 
     def check_order(self, order_id: int) -> dict[str, Any]:
         try:
             order = self._woocommerce_client.get_order(order_id)
         except (WooCommerceAPIError, ValueError) as exc:
-            return {
-                "ok": False,
-                "message": str(exc),
-            }
+            return self._error_result(
+                order_id=order_id,
+                message=str(exc),
+                order=None,
+                client_id=None,
+                amount=None,
+            )
 
         meta = self._meta_to_map(order.get("meta_data"))
         local_order = self._balance_order_service.get_local_order(order_id)
@@ -37,17 +45,20 @@ class BalancePaymentService:
                     status="error",
                     last_error=validation["message"],
                 )
-            return {
-                "ok": False,
-                "message": validation["message"],
-                "tickera_diagnostics": validation.get("tickera_diagnostics"),
-            }
+            return self._error_result(
+                order_id=order_id,
+                message=validation["message"],
+                order=order,
+                client_id=self._safe_int(meta.get("_bacano_client_id")),
+                amount=meta.get("_bacano_balance_amount"),
+                tickera_diagnostics=validation.get("tickera_diagnostics"),
+            )
 
         client_id = int(meta["_bacano_client_id"])
         amount_decimal = str(meta["_bacano_balance_amount"])
         client_lookup = self._find_client_by_id(client_id)
         if not client_lookup.get("ok"):
-            return self._build_result(
+            result = self._build_result(
                 order=order,
                 client_id=client_id,
                 amount_decimal=amount_decimal,
@@ -58,23 +69,23 @@ class BalancePaymentService:
                 can_credit=False,
                 reason=client_lookup.get("message") or "El cliente interno no existe.",
                 preview=None,
+                contains_tickera=False,
+                tickera_diagnostics=validation.get("tickera_diagnostics"),
             )
+            return self._attach_admin_alert(result, required=True)
 
-        paid_eval = self._evaluate_paid_status(order, meta)
+        paid_eval = self._evaluate_paid_status(order)
         credited = bool(local_load and local_load.get("status") == "applied")
-        local_status = self._resolve_local_status(local_order, local_load)
         can_credit = bool(paid_eval["paid"] and not credited)
 
         self._update_local_state_if_safe(
             order_id=order_id,
             local_order=local_order,
-            validation_ok=True,
             paid=paid_eval["paid"],
             cancelled=str(order.get("status") or "") == "cancelled",
             paid_at=str(order.get("date_paid") or "") or None,
         )
         local_order = self._balance_order_service.get_local_order(order_id)
-        local_status = self._resolve_local_status(local_order, local_load)
 
         preview = None
         if not credited:
@@ -92,7 +103,7 @@ class BalancePaymentService:
                 can_credit = False
                 paid_eval["reason"] = preview_result.get("message") or "No se puede acreditar."
 
-        return self._build_result(
+        result = self._build_result(
             order=order,
             client_id=client_id,
             amount_decimal=amount_decimal,
@@ -103,9 +114,13 @@ class BalancePaymentService:
             can_credit=can_credit,
             reason=paid_eval["reason"],
             preview=preview,
-            contains_tickera=bool(validation.get("contains_tickera")),
+            contains_tickera=False,
             tickera_diagnostics=validation.get("tickera_diagnostics"),
         )
+
+        # Los estados normales pendientes/cancelados no generan alerta. Las inconsistencias sí.
+        alert_required = bool(paid_eval.get("alert_required"))
+        return self._attach_admin_alert(result, required=alert_required)
 
     def _validate_balance_order(self, order: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
         tickera_analysis = self._analyze_tickera_evidence(order, meta)
@@ -119,11 +134,7 @@ class BalancePaymentService:
                 "tickera_diagnostics": tickera_analysis,
             }
 
-        for key in (
-            "_bacano_client_id",
-            "_bacano_balance_amount",
-            "_bacano_balance_status",
-        ):
+        for key in ("_bacano_client_id", "_bacano_balance_amount", "_bacano_balance_status"):
             if not str(meta.get(key) or "").strip():
                 return {
                     "ok": False,
@@ -161,32 +172,60 @@ class BalancePaymentService:
             "tickera_diagnostics": tickera_analysis,
         }
 
-    def _evaluate_paid_status(self, order: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
+    @staticmethod
+    def _evaluate_paid_status(order: dict[str, Any]) -> dict[str, Any]:
         status = str(order.get("status") or "")
         date_paid = order.get("date_paid")
         needs_payment = bool(order.get("needs_payment"))
         payment_method = str(order.get("payment_method") or "")
-        transaction_id = str(order.get("transaction_id") or "").strip()
 
         if status in {"failed", "cancelled", "refunded"}:
-            return {"paid": False, "reason": f"Estado WooCommerce no valido: {status}."}
+            return {
+                "paid": False,
+                "reason": f"Estado WooCommerce no valido: {status}.",
+                "alert_required": False,
+            }
         if status == "pending":
-            return {"paid": False, "reason": "El pedido todavia requiere pago."}
-        if status == "on-hold" and not date_paid:
-            return {"paid": False, "reason": "El pedido esta on-hold sin date_paid."}
+            return {
+                "paid": False,
+                "reason": "El pedido todavia requiere pago.",
+                "alert_required": False,
+            }
+        if payment_method and payment_method != MERCADO_PAGO_METHOD:
+            return {
+                "paid": False,
+                "reason": f"Metodo de pago no habilitado para acreditacion automatica: {payment_method}.",
+                "alert_required": False,
+            }
         if status not in {"processing", "completed"}:
-            return {"paid": False, "reason": f"Estado WooCommerce no habilitado: {status}."}
+            return {
+                "paid": False,
+                "reason": f"Estado WooCommerce no habilitado: {status}.",
+                "alert_required": False,
+            }
+        if payment_method != MERCADO_PAGO_METHOD:
+            return {
+                "paid": False,
+                "reason": "El pedido no fue pagado mediante Mercado Pago.",
+                "alert_required": False,
+            }
         if not date_paid:
-            return {"paid": False, "reason": "El pedido no tiene date_paid."}
+            return {
+                "paid": False,
+                "reason": "El pedido de Mercado Pago no tiene date_paid.",
+                "alert_required": True,
+            }
         if needs_payment:
-            return {"paid": False, "reason": "WooCommerce indica que el pedido aun necesita pago."}
+            return {
+                "paid": False,
+                "reason": "WooCommerce indica que el pedido de Mercado Pago aun necesita pago.",
+                "alert_required": True,
+            }
 
-        mp_reference_present = bool(transaction_id) or "mercado" in payment_method.lower()
-        if mp_reference_present:
-            return {"paid": True, "reason": "Pago confirmado en WooCommerce."}
         return {
             "paid": True,
-            "reason": "Pago confirmado en WooCommerce, sin referencia explicita de Mercado Pago.",
+            "reason": "Pago confirmado en WooCommerce mediante Mercado Pago.",
+            "alert_required": False,
         }
 
     def _build_result(
@@ -224,6 +263,47 @@ class BalancePaymentService:
             "tickera_diagnostics": tickera_diagnostics,
         }
 
+    def _error_result(
+        self,
+        *,
+        order_id: int,
+        message: str,
+        order: dict[str, Any] | None,
+        client_id: int | None,
+        amount: str | None,
+        tickera_diagnostics: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = {
+            "ok": False,
+            "order_id": order_id,
+            "message": message,
+            "woocommerce_status": str((order or {}).get("status") or ""),
+            "payment_method": str((order or {}).get("payment_method") or ""),
+            "client_id": client_id,
+            "amount": amount,
+            "tickera_diagnostics": tickera_diagnostics,
+        }
+        return self._attach_admin_alert(result, required=True)
+
+    def _attach_admin_alert(self, result: dict[str, Any], *, required: bool) -> dict[str, Any]:
+        result["admin_alert_required"] = bool(required)
+        result["admin_phone"] = self._admin_phone or None
+        result["admin_alert_message"] = None
+        if not required:
+            return result
+
+        reason = str(result.get("reason") or result.get("message") or "Error desconocido")
+        result["admin_alert_message"] = (
+            "ALERTA BACANO BOT - CARGA DE SALDO\n"
+            f"Order ID: {result.get('order_id')}\n"
+            f"Estado WooCommerce: {result.get('woocommerce_status') or '-'}\n"
+            f"Metodo de pago: {result.get('payment_method') or '-'}\n"
+            f"Cliente interno: {result.get('client_id') if result.get('client_id') is not None else '-'}\n"
+            f"Importe: {result.get('amount') or '-'}\n"
+            f"Motivo: {reason}"
+        )
+        return result
+
     @staticmethod
     def _meta_to_map(meta_data: Any) -> dict[str, str]:
         result: dict[str, str] = {}
@@ -233,9 +313,8 @@ class BalancePaymentService:
             if not isinstance(item, dict):
                 continue
             key = str(item.get("key") or "").strip()
-            if not key:
-                continue
-            result[key] = str(item.get("value") or "")
+            if key:
+                result[key] = str(item.get("value") or "")
         return result
 
     @staticmethod
@@ -250,15 +329,12 @@ class BalancePaymentService:
                     if key:
                         item_meta_keys.append(key)
 
-            product_id = item.get("product_id")
-            variation_id = item.get("variation_id")
-            name = str(item.get("name") or "").strip()
             line_items_summary.append(
                 {
                     "id": item.get("id"),
-                    "name": name,
-                    "product_id": product_id,
-                    "variation_id": variation_id,
+                    "name": str(item.get("name") or "").strip(),
+                    "product_id": item.get("product_id"),
+                    "variation_id": item.get("variation_id"),
                     "meta_keys": item_meta_keys,
                 }
             )
@@ -326,10 +402,7 @@ class BalancePaymentService:
             )
             row = cursor.fetchone()
             if not row:
-                return {
-                    "ok": False,
-                    "message": "El cliente interno ya no existe en MySQL.",
-                }
+                return {"ok": False, "message": "El cliente interno ya no existe en MySQL."}
             return {
                 "ok": True,
                 "client_id": int(row["Cli_Indice"]),
@@ -337,10 +410,7 @@ class BalancePaymentService:
                 "name": str(row.get("Cli_Razon") or "").strip(),
             }
         except Exception as exc:
-            return {
-                "ok": False,
-                "message": str(exc) or "No se pudo validar el cliente interno.",
-            }
+            return {"ok": False, "message": str(exc) or "No se pudo validar el cliente interno."}
         finally:
             if cursor is not None:
                 cursor.close()
@@ -373,19 +443,11 @@ class BalancePaymentService:
         *,
         order_id: int,
         local_order: dict[str, Any] | None,
-        validation_ok: bool,
         paid: bool,
         cancelled: bool,
         paid_at: str | None,
     ) -> None:
         if not local_order:
-            return
-        if not validation_ok:
-            self._balance_order_service.update_local_order_status(
-                order_id,
-                status="error",
-                last_error="metadata_invalida",
-            )
             return
         if cancelled:
             self._balance_order_service.update_local_order_status(
@@ -407,3 +469,10 @@ class BalancePaymentService:
             status="awaiting_payment",
             last_error=None,
         )
+
+    @staticmethod
+    def _safe_int(value: Any) -> int | None:
+        try:
+            return int(str(value))
+        except Exception:
+            return None
