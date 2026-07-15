@@ -198,6 +198,7 @@ class BalanceOrderService:
         *,
         status: str,
         paid_at: str | None = None,
+        credited_at: str | None = None,
         last_error: str | None = None,
     ) -> None:
         with self._connect_sqlite() as conn:
@@ -206,10 +207,11 @@ class BalanceOrderService:
                 UPDATE balance_orders
                 SET status = ?,
                     paid_at = COALESCE(?, paid_at),
+                    credited_at = COALESCE(?, credited_at),
                     last_error = ?
                 WHERE woocommerce_order_id = ?
                 """,
-                (status, paid_at, last_error, order_id),
+                (status, paid_at, credited_at, last_error, order_id),
             )
             conn.commit()
 
