@@ -17,6 +17,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from services.balance_admin_service import BalanceAdminService
 from services.balance_settings_service import BalanceSettingsService
+from services.ticket_admin_service import TicketAdminService
+from services.ticket_settings_service import TicketSettingsService
+from utils.phone_utils import normalize_argentine_phone
 
 
 class BacanoBotGUI:
@@ -45,6 +48,11 @@ class BacanoBotGUI:
         self.balance_settings_service = BalanceSettingsService()
         self.balance_admin_service = None
         self.balance_rows = {}
+        self.ticket_settings_service = TicketSettingsService()
+        self.ticket_admin_service = None
+        self.ticket_rows = {}
+        self.ticket_selected_order_id = None
+        self.ticket_detail_data = None
 
         self.setup_ui()
 
@@ -110,6 +118,11 @@ class BacanoBotGUI:
         self.tab_balance = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_balance, text='💳 Cargas')
         self.setup_balance_tab()
+
+        # Pestaña de administración de entradas
+        self.tab_tickets = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_tickets, text='🎟 Entradas')
+        self.setup_tickets_tab()
 
         # Pestaña 2: Logs
         self.tab_logs = ttk.Frame(self.notebook)
@@ -480,6 +493,443 @@ class BacanoBotGUI:
         self.balance_detail.delete("1.0", tk.END)
         self.balance_detail.insert("1.0", text)
         self.balance_detail.config(state="disabled")
+
+    def setup_tickets_tab(self):
+        controls = ttk.LabelFrame(self.tab_tickets, text="Controles operativos", padding=10)
+        controls.pack(fill="x", padx=10, pady=10)
+
+        self.ticket_monitor_enabled_var = tk.BooleanVar(value=False)
+        self.ticket_test_mode_var = tk.BooleanVar(value=True)
+        self.ticket_auto_send_var = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(
+            controls,
+            text="Monitor de entradas ON",
+            variable=self.ticket_monitor_enabled_var,
+            command=self.on_ticket_monitor_toggle,
+        ).grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(
+            controls,
+            text="Modo prueba",
+            variable=self.ticket_test_mode_var,
+            command=self.on_ticket_test_mode_toggle,
+        ).grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(
+            controls,
+            text="Envio automatico al comprador",
+            variable=self.ticket_auto_send_var,
+            command=self.on_ticket_auto_send_toggle,
+        ).grid(row=0, column=2, sticky="w", padx=5, pady=3)
+        ttk.Button(controls, text="Guardar controles", command=self.save_ticket_settings).grid(
+            row=0, column=5, padx=10, pady=3
+        )
+
+        ttk.Label(controls, text="Telefono de prueba:").grid(row=1, column=0, sticky="e", padx=5)
+        self.ticket_test_phone_entry = ttk.Entry(controls, width=18)
+        self.ticket_test_phone_entry.grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(controls, text="Intervalo (seg):").grid(row=1, column=2, sticky="e", padx=5)
+        self.ticket_interval_entry = ttk.Entry(controls, width=8)
+        self.ticket_interval_entry.grid(row=1, column=3, sticky="w", padx=5)
+
+        self.ticket_mode_label = ttk.Label(controls, text="Modo efectivo: monitor apagado", foreground="gray")
+        self.ticket_mode_label.grid(row=2, column=0, columnspan=6, sticky="w", padx=5, pady=(6, 0))
+
+        advanced = ttk.LabelFrame(
+            self.tab_tickets,
+            text="Configuracion avanzada / backfill inicial",
+            padding=8,
+        )
+        advanced.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Label(
+            advanced,
+            text="Sirve para definir desde donde empezar a revisar pedidos historicos. No es un control cotidiano.",
+        ).grid(row=0, column=0, columnspan=4, sticky="w", padx=5, pady=(0, 6))
+        ttk.Label(advanced, text="Order ID minimo:").grid(row=1, column=0, sticky="e", padx=5)
+        self.ticket_after_order_entry = ttk.Entry(advanced, width=14)
+        self.ticket_after_order_entry.grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(advanced, text="Fecha minima ISO:").grid(row=1, column=2, sticky="e", padx=5)
+        self.ticket_after_date_entry = ttk.Entry(advanced, width=25)
+        self.ticket_after_date_entry.grid(row=1, column=3, sticky="w", padx=5)
+
+        filters = ttk.Frame(self.tab_tickets)
+        filters.pack(fill="x", padx=10, pady=(0, 5))
+        ttk.Label(filters, text="Estado:").pack(side="left")
+        self.ticket_status_filter = ttk.Combobox(
+            filters,
+            state="readonly",
+            values=(
+                "Todos",
+                "Detectado",
+                "Esperando pago",
+                "Esperando ticket",
+                "Listo",
+                "Enviando",
+                "Enviado",
+                "Error reintentable",
+                "Error permanente",
+                "Ignorado",
+                "Simulado",
+            ),
+            width=18,
+        )
+        self.ticket_status_filter.set("Todos")
+        self.ticket_status_filter.pack(side="left", padx=5)
+        self.ticket_show_ignored_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filters,
+            text="Mostrar ignorados",
+            variable=self.ticket_show_ignored_var,
+        ).pack(side="left", padx=(10, 5))
+        ttk.Label(filters, text="Order ID:").pack(side="left", padx=(15, 0))
+        self.ticket_order_search = ttk.Entry(filters, width=14)
+        self.ticket_order_search.pack(side="left", padx=5)
+        ttk.Button(filters, text="Actualizar", command=self.refresh_ticket_deliveries).pack(side="left", padx=5)
+        self.ticket_refresh_status = ttk.Label(filters, text="")
+        self.ticket_refresh_status.pack(side="left", padx=10)
+
+        content = ttk.Panedwindow(self.tab_tickets, orient=tk.HORIZONTAL)
+        content.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        table_frame = ttk.Frame(content)
+        detail_frame = ttk.LabelFrame(content, text="Detalle del pedido", padding=8)
+        content.add(table_frame, weight=3)
+        content.add(detail_frame, weight=2)
+
+        columns = (
+            "order_id", "date", "client", "original_phone", "normalized_phone",
+            "expected", "progress", "status", "last_sent", "error",
+        )
+        self.ticket_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=14)
+        headings = {
+            "order_id": "Order ID",
+            "date": "Fecha",
+            "client": "Cliente",
+            "original_phone": "Telefono original",
+            "normalized_phone": "Telefono WhatsApp",
+            "expected": "Esperados",
+            "progress": "Encontrados/Enviados",
+            "status": "Estado",
+            "last_sent": "Ultimo envio",
+            "error": "Ultimo error",
+        }
+        widths = {
+            "order_id": 80,
+            "date": 145,
+            "client": 150,
+            "original_phone": 120,
+            "normalized_phone": 135,
+            "expected": 70,
+            "progress": 120,
+            "status": 120,
+            "last_sent": 145,
+            "error": 220,
+        }
+        for column in columns:
+            self.ticket_tree.heading(column, text=headings[column])
+            self.ticket_tree.column(column, width=widths[column], anchor="w")
+        v_scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.ticket_tree.yview)
+        h_scroll = ttk.Scrollbar(table_frame, orient="horizontal", command=self.ticket_tree.xview)
+        self.ticket_tree.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        self.ticket_tree.grid(row=0, column=0, sticky="nsew")
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll.grid(row=1, column=0, sticky="ew")
+        self.ticket_tree.bind("<<TreeviewSelect>>", self.on_ticket_selected)
+
+        form = ttk.Frame(detail_frame)
+        form.pack(fill="x", pady=(0, 8))
+        form.grid_columnconfigure(1, weight=1)
+        self.ticket_detail_labels = {}
+        row = 0
+        for key, label in (
+            ("order_id", "Order ID"),
+            ("client_name", "Cliente"),
+            ("original_phone", "Telefono WooCommerce"),
+            ("normalized_phone", "Telefono normalizado"),
+            ("expected_tickets", "Tickets"),
+            ("display_status", "Estado"),
+            ("last_sent_at", "Ultimo envio"),
+            ("last_error", "Ultimo error"),
+        ):
+            ttk.Label(form, text=f"{label}:").grid(row=row, column=0, sticky="nw", padx=(0, 6), pady=2)
+            value = ttk.Label(form, text="-", wraplength=260, justify="left")
+            value.grid(row=row, column=1, sticky="w", pady=2)
+            self.ticket_detail_labels[key] = value
+            row += 1
+
+        destination_frame = ttk.Frame(detail_frame)
+        destination_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(destination_frame, text="Telefono destino editable:").pack(anchor="w")
+        self.ticket_destination_entry = ttk.Entry(destination_frame)
+        self.ticket_destination_entry.pack(fill="x", pady=(2, 4))
+        self.ticket_destination_preview = ttk.Label(destination_frame, text="Normalizado: -", foreground="gray")
+        self.ticket_destination_preview.pack(anchor="w")
+        self.ticket_destination_entry.bind("<KeyRelease>", self.on_ticket_destination_changed)
+
+        ttk.Label(detail_frame, text="PDFs disponibles:").pack(anchor="w")
+        self.ticket_pdf_list = tk.Listbox(detail_frame, height=5)
+        self.ticket_pdf_list.pack(fill="both", expand=False, pady=(2, 6))
+
+        action_frame = ttk.Frame(detail_frame)
+        action_frame.pack(fill="x", pady=(0, 6))
+        ttk.Button(action_frame, text="Reenviar tickets", command=self.manual_resend_selected_ticket).pack(side="left")
+
+        self.ticket_detail = scrolledtext.ScrolledText(detail_frame, height=9, wrap=tk.WORD)
+        self.ticket_detail.pack(fill="both", expand=True)
+        self.ticket_detail.insert("1.0", "Selecciona un pedido para ver detalle y reenviar manualmente.")
+        self.ticket_detail.config(state="disabled")
+
+        self.load_ticket_settings()
+
+    def load_ticket_settings(self):
+        settings = self.ticket_settings_service.get_settings()
+        self.ticket_monitor_enabled_var.set(settings["monitor_enabled"])
+        self.ticket_test_mode_var.set(settings["test_mode"])
+        self.ticket_auto_send_var.set(settings["auto_send_customer"])
+        self.ticket_test_phone_entry.delete(0, tk.END)
+        self.ticket_test_phone_entry.insert(0, settings.get("test_phone") or "")
+        self.ticket_after_order_entry.delete(0, tk.END)
+        self.ticket_after_order_entry.insert(0, settings.get("monitor_after_order_id") or "")
+        self.ticket_after_date_entry.delete(0, tk.END)
+        self.ticket_after_date_entry.insert(0, settings.get("monitor_after_date") or "")
+        self.ticket_interval_entry.delete(0, tk.END)
+        self.ticket_interval_entry.insert(0, settings.get("monitor_interval") or 60)
+        self.refresh_ticket_mode_label()
+
+    def refresh_ticket_mode_label(self):
+        if not self.ticket_monitor_enabled_var.get():
+            text = "Modo efectivo: monitor apagado"
+        elif self.ticket_test_mode_var.get():
+            text = "Modo efectivo: live-test (solo telefono de prueba)"
+        elif self.ticket_auto_send_var.get():
+            text = "Modo efectivo: envio automatico al comprador"
+        else:
+            text = "Modo efectivo: simulacion segura sin envio automatico"
+        self.ticket_mode_label.config(text=text)
+
+    def on_ticket_monitor_toggle(self):
+        if not self.ticket_monitor_enabled_var.get():
+            self.ticket_auto_send_var.set(False)
+        self.refresh_ticket_mode_label()
+
+    def on_ticket_test_mode_toggle(self):
+        if self.ticket_test_mode_var.get():
+            self.ticket_auto_send_var.set(False)
+        self.refresh_ticket_mode_label()
+
+    def on_ticket_auto_send_toggle(self):
+        if self.ticket_auto_send_var.get():
+            if not self.ticket_monitor_enabled_var.get():
+                self.ticket_auto_send_var.set(False)
+                messagebox.showwarning("Entradas", "Primero activa el monitor.")
+            elif self.ticket_test_mode_var.get():
+                self.ticket_auto_send_var.set(False)
+                messagebox.showwarning("Entradas", "El modo prueba tiene prioridad absoluta.")
+        self.refresh_ticket_mode_label()
+
+    def save_ticket_settings(self):
+        try:
+            settings = self.ticket_settings_service.update_settings(
+                monitor_enabled=self.ticket_monitor_enabled_var.get(),
+                test_mode=self.ticket_test_mode_var.get(),
+                auto_send_customer=self.ticket_auto_send_var.get(),
+                test_phone=self.ticket_test_phone_entry.get().strip() or None,
+                monitor_after_order_id=self.ticket_after_order_entry.get().strip() or None,
+                monitor_after_date=self.ticket_after_date_entry.get().strip() or None,
+                monitor_interval=self.ticket_interval_entry.get().strip() or 60,
+            )
+            self.load_ticket_settings()
+            self.log("Controles operativos de entradas guardados")
+            messagebox.showinfo("Entradas", "Controles guardados correctamente.")
+            return settings
+        except Exception as exc:
+            messagebox.showerror("Entradas", str(exc))
+            return None
+
+    def refresh_ticket_deliveries(self):
+        raw_order_id = self.ticket_order_search.get().strip()
+        if raw_order_id and not raw_order_id.isdigit():
+            messagebox.showerror("Entradas", "El Order ID debe ser numerico.")
+            return
+        order_id = int(raw_order_id) if raw_order_id else None
+        status = self.ticket_status_filter.get()
+        self.ticket_refresh_status.config(text="Actualizando...")
+
+        def worker():
+            try:
+                if self.ticket_admin_service is None:
+                    self.ticket_admin_service = TicketAdminService()
+                rows = self.ticket_admin_service.list_recent_deliveries(
+                    limit=100,
+                    status=status,
+                    order_id=order_id,
+                    show_ignored=self.ticket_show_ignored_var.get(),
+                )
+                self.root.after(0, lambda: self.populate_ticket_rows(rows))
+            except Exception as exc:
+                self.root.after(0, lambda value=str(exc): self.ticket_refresh_failed(value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def populate_ticket_rows(self, rows):
+        self.ticket_tree.delete(*self.ticket_tree.get_children())
+        self.ticket_rows = {int(row["order_id"]): row for row in rows}
+        for row in rows:
+            self.ticket_tree.insert("", "end", iid=str(row["order_id"]), values=(
+                row["order_id"],
+                row.get("date") or "-",
+                row.get("client_name") or "-",
+                row.get("original_phone") or "-",
+                row.get("normalized_phone") or "-",
+                row.get("expected_tickets") or 0,
+                row.get("ticket_progress") or "0/0",
+                row.get("display_status") or "-",
+                row.get("last_sent_at") or "-",
+                row.get("last_error") or "-",
+            ))
+        self.ticket_refresh_status.config(text=f"{len(rows)} entrega(s)")
+
+    def ticket_refresh_failed(self, message):
+        self.ticket_refresh_status.config(text="Error")
+        messagebox.showerror("Entradas", message)
+
+    def on_ticket_selected(self, _event=None):
+        selected = self.ticket_tree.selection()
+        if not selected:
+            return
+        self.ticket_selected_order_id = int(selected[0])
+        self.set_ticket_detail_text("Cargando detalle...")
+        self.ticket_pdf_list.delete(0, tk.END)
+
+        def worker():
+            try:
+                if self.ticket_admin_service is None:
+                    self.ticket_admin_service = TicketAdminService()
+                detail = self.ticket_admin_service.get_delivery_detail(
+                    self.ticket_selected_order_id,
+                    include_pdfs=True,
+                )
+                self.root.after(0, lambda value=detail: self.render_ticket_detail(value))
+            except Exception as exc:
+                self.root.after(0, lambda value=str(exc): self.ticket_refresh_failed(value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def render_ticket_detail(self, detail):
+        self.ticket_detail_data = detail
+        for key, widget in self.ticket_detail_labels.items():
+            value = detail.get(key)
+            if key == "expected_tickets":
+                value = (
+                    f"{detail.get('expected_tickets', 0)} esperados | "
+                    f"{detail.get('found_tickets', 0)} encontrados | "
+                    f"{detail.get('sent_tickets', 0)} enviados"
+                )
+            widget.config(text=value or "-")
+
+        destination = detail.get("destination_phone") or ""
+        self.ticket_destination_entry.delete(0, tk.END)
+        self.ticket_destination_entry.insert(0, destination)
+        self.on_ticket_destination_changed()
+
+        self.ticket_pdf_list.delete(0, tk.END)
+        pdf_files = detail.get("pdf_files") or []
+        for pdf_file in pdf_files:
+            self.ticket_pdf_list.insert(tk.END, pdf_file)
+        if not pdf_files and detail.get("pdf_error"):
+            self.ticket_pdf_list.insert(tk.END, f"Sin PDFs listos: {detail['pdf_error']}")
+
+        manual_lines = []
+        for item in detail.get("manual_history") or []:
+            manual_lines.append(
+                f"- {item.get('created_at')} | {item.get('status')} | "
+                f"{item.get('normalized_phone') or item.get('destination_phone')}"
+            )
+        text = (
+            f"Order ID: {detail.get('order_id')}\n"
+            f"Cliente: {detail.get('client_name')}\n"
+            f"Telefono original: {detail.get('original_phone') or '-'}\n"
+            f"Telefono normalizado: {detail.get('normalized_phone') or '-'}\n"
+            f"Estado: {detail.get('display_status')}\n"
+            f"Ultimo error: {detail.get('last_error') or '-'}\n"
+            f"Ultimo envio: {detail.get('last_sent_at') or '-'}\n"
+            f"PDFs listos: {detail.get('pdf_count', 0)}\n"
+            f"Historial manual:\n"
+            + ("\n".join(manual_lines) if manual_lines else "- Sin reenvios manuales")
+        )
+        self.set_ticket_detail_text(text)
+
+    def on_ticket_destination_changed(self, _event=None):
+        raw_phone = self.ticket_destination_entry.get().strip()
+        normalized = normalize_argentine_phone(raw_phone)
+        if normalized:
+            self.ticket_destination_preview.config(text=f"Normalizado: {normalized}", foreground="green")
+        elif raw_phone:
+            self.ticket_destination_preview.config(text="Normalizado: numero invalido", foreground="red")
+        else:
+            self.ticket_destination_preview.config(text="Normalizado: -", foreground="gray")
+
+    def manual_resend_selected_ticket(self):
+        if not self.ticket_detail_data or not self.ticket_selected_order_id:
+            messagebox.showwarning("Entradas", "Selecciona un pedido primero.")
+            return
+
+        destination_phone = self.ticket_destination_entry.get().strip()
+        normalized = normalize_argentine_phone(destination_phone)
+        if not normalized:
+            messagebox.showerror("Entradas", "El telefono de destino no es valido.")
+            return
+
+        pdf_count = len(self.ticket_detail_data.get("pdf_files") or [])
+        if pdf_count <= 0:
+            messagebox.showerror("Entradas", "No hay PDFs disponibles para reenviar.")
+            return
+
+        order_id = int(self.ticket_selected_order_id)
+
+        if not messagebox.askyesno(
+            "Reenviar tickets",
+            f"Order ID: {order_id}\n"
+            f"Comprador: {self.ticket_detail_data.get('client_name') or '-'}\n"
+            f"Telefono original: {self.ticket_detail_data.get('original_phone') or '-'}\n"
+            f"Telefono destino: {normalized}\n"
+            f"Cantidad de tickets/PDFs: {pdf_count}\n\n"
+            "Confirmas el reenvio manual?",
+        ):
+            return
+        self.ticket_refresh_status.config(text="Reenviando...")
+
+        def worker():
+            try:
+                if self.ticket_admin_service is None:
+                    self.ticket_admin_service = TicketAdminService()
+                result = self.ticket_admin_service.resend_tickets(order_id, destination_phone)
+                self.root.after(0, lambda value=result: self.handle_manual_resend_result(value))
+            except Exception as exc:
+                self.root.after(0, lambda value=str(exc): self.ticket_refresh_failed(value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def handle_manual_resend_result(self, result):
+        if result.get("ok"):
+            self.ticket_refresh_status.config(text="Reenvio manual OK")
+            self.log(f"Reenvio manual de entradas OK para order {result.get('order_id')}")
+            messagebox.showinfo(
+                "Entradas",
+                f"Se reenviaron {result.get('sent_tickets', 0)} PDF(s) a {result.get('normalized_destination')}.",
+            )
+        else:
+            self.ticket_refresh_status.config(text="Reenvio manual con error")
+            messagebox.showerror("Entradas", str(result.get("reason") or "No se pudo reenviar."))
+        self.refresh_ticket_deliveries()
+        if self.ticket_selected_order_id:
+            self.on_ticket_selected()
+
+    def set_ticket_detail_text(self, text):
+        self.ticket_detail.config(state="normal")
+        self.ticket_detail.delete("1.0", tk.END)
+        self.ticket_detail.insert("1.0", text)
+        self.ticket_detail.config(state="disabled")
 
     def setup_config_tab(self):
         # Frame principal
@@ -859,7 +1309,11 @@ class BacanoBotGUI:
 
         self.flask_log.insert(tk.END, f"{formatted_message}\n")
         self.flask_log.see(tk.END)
-        print(formatted_message)
+        try:
+            print(formatted_message)
+        except UnicodeEncodeError:
+            safe_message = formatted_message.encode("cp1252", errors="replace").decode("cp1252")
+            print(safe_message)
 
         # Actualizar barra de estado brevemente
         self.status_bar.config(text=message)

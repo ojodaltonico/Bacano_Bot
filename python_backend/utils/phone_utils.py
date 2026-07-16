@@ -12,30 +12,34 @@ def normalize_argentine_phone(phone: Any) -> str | None:
     if not digits:
         return None
 
+    if digits.startswith("00"):
+        digits = digits[2:]
+
     if digits.startswith("0"):
         digits = digits[1:]
 
+    if digits.startswith("15") and len(digits) <= 10:
+        return None
+
     if digits.startswith("549"):
-        normalized = digits
+        normalized = _normalize_international_mobile(digits)
     elif digits.startswith("54"):
         rest = digits[2:]
         if rest.startswith("9"):
-            normalized = digits
+            normalized = _normalize_international_mobile(f"54{rest}")
         else:
-            normalized = f"549{rest}"
+            local_number = _strip_local_mobile_prefix(rest)
+            normalized = f"549{local_number}" if len(local_number) == 10 else None
     elif len(digits) == 10:
         normalized = f"549{digits}"
     elif len(digits) in {11, 12} and digits.startswith("9"):
-        normalized = f"54{digits}"
+        local_number = _strip_local_mobile_prefix(digits[1:])
+        normalized = f"549{local_number}" if len(local_number) == 10 else None
     else:
-        normalized = digits
+        local_number = _strip_local_mobile_prefix(digits)
+        normalized = f"549{local_number}" if len(local_number) == 10 else None
 
-    if normalized.startswith("549") and len(normalized) >= 13:
-        idx = normalized.find("15", 3)
-        if idx != -1:
-            normalized = normalized[:idx] + normalized[idx + 2 :]
-
-    if not normalized.isdigit():
+    if not normalized or not normalized.isdigit():
         return None
     if len(normalized) < 12 or len(normalized) > 14:
         return None
@@ -83,3 +87,26 @@ def mask_phone(phone: Any) -> str:
         return "*" * len(digits)
     return "*" * (len(digits) - 4) + digits[-4:]
 
+
+def _normalize_international_mobile(digits: str) -> str | None:
+    if not digits.startswith("54"):
+        return None
+
+    rest = digits[2:]
+    if rest.startswith("9"):
+        local_number = _strip_local_mobile_prefix(rest[1:])
+        return f"549{local_number}" if len(local_number) == 10 else None
+
+    local_number = _strip_local_mobile_prefix(rest)
+    return f"549{local_number}" if len(local_number) == 10 else None
+
+
+def _strip_local_mobile_prefix(digits: str) -> str:
+    if len(digits) in {11, 12}:
+        idx = digits.find("15", 2)
+        if idx != -1:
+            area_length = idx
+            subscriber_length = len(digits) - idx - 2
+            if area_length in {2, 3, 4} and subscriber_length in {6, 7, 8}:
+                return digits[:idx] + digits[idx + 2 :]
+    return digits

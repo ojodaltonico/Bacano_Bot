@@ -10,6 +10,7 @@ from integrations.woocommerce_client import WooCommerceClient
 from services.delivery_state_service import DeliveryStateService
 from services.order_classification import evaluate_ticket_order, meta_to_map
 from services.ticket_delivery_service import TicketDeliveryService
+from services.ticket_settings_service import TicketSettingsService
 from utils.phone_utils import mask_phone, normalize_argentine_phone
 
 
@@ -25,16 +26,91 @@ class OrderMonitorService:
         woocommerce_client: WooCommerceClient | None = None,
         ticket_delivery_service: TicketDeliveryService | None = None,
         delivery_state_service: DeliveryStateService | None = None,
+        settings_service: TicketSettingsService | None = None,
     ) -> None:
         self._woocommerce_client = woocommerce_client or WooCommerceClient()
         self._ticket_delivery_service = ticket_delivery_service or TicketDeliveryService()
         self._delivery_state_service = delivery_state_service or DeliveryStateService()
+        self._settings_service = settings_service
 
-    def scan_recent_orders(self, limit: int = 20, dry_run: bool = True) -> dict[str, Any]:
+    def scan_configured_orders(self, limit: int = 20) -> dict[str, Any]:
+        settings_service = self._settings_service or TicketSettingsService()
+        settings = settings_service.get_settings()
+        if not settings["monitor_enabled"]:
+            return {
+                "mode": "disabled",
+                "filters": {},
+                "summary": self._build_summary([]),
+                "results": [],
+                "reason": "El monitor de entradas esta apagado.",
+            }
+
+        if settings["test_mode"]:
+            test_phone = str(settings.get("test_phone") or "").strip()
+            normalized_test_phone = self._normalize_argentine_phone(test_phone)
+            if not normalized_test_phone:
+                return {
+                    "mode": "invalid_config",
+                    "filters": {},
+                    "summary": self._build_summary([]),
+                    "results": [],
+                    "reason": "Falta un telefono de prueba valido para el modo test.",
+                }
+            result = self.live_test_recent_orders(
+                limit=limit,
+                test_phone=normalized_test_phone,
+                after_order_id=settings.get("monitor_after_order_id"),
+                after_date=settings.get("monitor_after_date"),
+            )
+            result["mode"] = "live-test"
+            result["filters"] = {
+                "after_order_id": settings.get("monitor_after_order_id"),
+                "after_date": settings.get("monitor_after_date"),
+            }
+            return result
+
+        if settings["auto_send_customer"]:
+            result = self.live_recent_orders(
+                limit=limit,
+                after_order_id=settings.get("monitor_after_order_id"),
+                after_date=settings.get("monitor_after_date"),
+            )
+            result["mode"] = "live"
+            result["filters"] = {
+                "after_order_id": settings.get("monitor_after_order_id"),
+                "after_date": settings.get("monitor_after_date"),
+            }
+            return result
+
+        result = self.scan_recent_orders(
+            limit=limit,
+            dry_run=True,
+            after_order_id=settings.get("monitor_after_order_id"),
+            after_date=settings.get("monitor_after_date"),
+        )
+        result["mode"] = "dry-run"
+        result["filters"] = {
+            "after_order_id": settings.get("monitor_after_order_id"),
+            "after_date": settings.get("monitor_after_date"),
+        }
+        return result
+
+    def scan_recent_orders(
+        self,
+        limit: int = 20,
+        dry_run: bool = True,
+        after_order_id: int | None = None,
+        after_date: str | None = None,
+    ) -> dict[str, Any]:
         if limit <= 0:
             raise ValueError("limit debe ser mayor que 0.")
 
-        orders = self._fetch_order_pages(page_size=min(limit, 100), limit=limit, after_order_id=None)
+        orders = self._fetch_order_pages(
+            page_size=min(limit, 100),
+            limit=limit,
+            after_order_id=after_order_id,
+            after_date=after_date,
+        )
         results: list[dict[str, Any]] = []
 
         for order in orders:
@@ -61,7 +137,11 @@ class OrderMonitorService:
         }
 
     def live_test_recent_orders(
-        self, limit: int, test_phone: str, after_order_id: int
+        self,
+        limit: int,
+        test_phone: str,
+        after_order_id: int | None,
+        after_date: str | None = None,
     ) -> dict[str, Any]:
         normalized_test_phone = self._normalize_argentine_phone(test_phone)
         if not normalized_test_phone:
@@ -71,12 +151,13 @@ class OrderMonitorService:
             page_size=min(limit, 100),
             limit=limit,
             after_order_id=after_order_id,
+            after_date=after_date,
         )
         results: list[dict[str, Any]] = []
 
         for order in orders:
             order_id = self._safe_order_id(order)
-            if order_id <= after_order_id:
+            if after_order_id is not None and order_id <= after_order_id:
                 continue
             try:
                 result = self._live_test_single_order(order, normalized_test_phone)
@@ -100,17 +181,23 @@ class OrderMonitorService:
             "summary": self._build_summary(results),
         }
 
-    def live_recent_orders(self, limit: int, after_order_id: int) -> dict[str, Any]:
+    def live_recent_orders(
+        self,
+        limit: int,
+        after_order_id: int | None,
+        after_date: str | None = None,
+    ) -> dict[str, Any]:
         orders = self._fetch_order_pages(
             page_size=min(limit, 100),
             limit=limit,
             after_order_id=after_order_id,
+            after_date=after_date,
         )
         results: list[dict[str, Any]] = []
 
         for order in orders:
             order_id = self._safe_order_id(order)
-            if order_id <= after_order_id:
+            if after_order_id is not None and order_id <= after_order_id:
                 continue
             try:
                 result = self._live_single_order(order)
@@ -343,7 +430,24 @@ class OrderMonitorService:
                 "state_saved": "permanent_error",
             }
 
-        destination_dir = DEBUG_DIR / f"delivery_live_{order_id}"
+        previous_prompted = bool(state and state.get("status") == "awaiting_customer_confirmation")
+        if previous_prompted:
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "already_prompted": True,
+                "reason": "awaiting_customer_confirmation",
+                "status": delivery_info.get("status"),
+                "payment_method": delivery_info.get("payment_method"),
+                "expected_tickets": int(delivery_info.get("expected_tickets") or 0),
+                "found_tickets": int(state.get("found_tickets") or 0),
+                "sent_tickets": int(state.get("sent_tickets") or 0),
+                "billing_phone_present": billing_phone_present,
+                "billing_phone_normalizable": True,
+                "masked_destination": masked_billing_phone,
+            }
+
+        destination_dir = DEBUG_DIR / f"delivery_live_intro_{order_id}"
         prepare_result = self._ticket_delivery_service.prepare_order_tickets(
             order_id, destination_dir
         )
@@ -381,15 +485,142 @@ class OrderMonitorService:
                 "masked_destination": masked_billing_phone,
             }
 
-        self._delivery_state_service.mark_sending(
+        intro_message = self._build_customer_intro_confirmation_message(
+            prepare_result.get("ticket_pdfs") or [],
+            int(prepare_result.get("expected_tickets") or 0),
+        )
+        ok, detail = self._send_text_to_bot(normalized_billing_phone, intro_message)
+        if not ok:
+            self._delivery_state_service.mark_retryable_error(
+                order_id,
+                payment_method=delivery_info.get("payment_method"),
+                order_status=delivery_info.get("status"),
+                expected_tickets=int(prepare_result.get("expected_tickets") or 0),
+                found_tickets=int(prepare_result.get("found_tickets") or 0),
+                sent_tickets=0,
+                phone_normalized=normalized_billing_phone,
+                last_error=detail,
+                metadata_json={"summary": "intro send failed"},
+            )
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "already_sent": False,
+                "reason": detail,
+                "status": delivery_info.get("status"),
+                "payment_method": delivery_info.get("payment_method"),
+                "expected_tickets": prepare_result.get("expected_tickets", 0),
+                "found_tickets": prepare_result.get("found_tickets", 0),
+                "sent_tickets": 0,
+                "billing_phone_present": billing_phone_present,
+                "billing_phone_normalizable": True,
+                "masked_destination": masked_billing_phone,
+                "state_saved": "retryable_error",
+            }
+
+        self._delivery_state_service.mark_awaiting_customer_confirmation(
             order_id,
             payment_method=delivery_info.get("payment_method"),
             order_status=delivery_info.get("status"),
             expected_tickets=int(prepare_result.get("expected_tickets") or 0),
             found_tickets=int(prepare_result.get("found_tickets") or 0),
+            sent_tickets=0,
             phone_normalized=normalized_billing_phone,
-            metadata_json={"summary": "sending_live"},
+            last_error=None,
+            metadata_json={"summary": "awaiting_customer_confirmation"},
         )
+        return {
+            "ok": True,
+            "order_id": order_id,
+            "already_sent": False,
+            "awaiting_customer_confirmation": True,
+            "status": delivery_info.get("status"),
+            "payment_method": delivery_info.get("payment_method"),
+            "expected_tickets": prepare_result.get("expected_tickets", 0),
+            "found_tickets": prepare_result.get("found_tickets", 0),
+            "sent_tickets": 0,
+            "billing_phone_present": billing_phone_present,
+            "billing_phone_normalizable": True,
+            "masked_destination": masked_billing_phone,
+            "state_saved": "awaiting_customer_confirmation",
+        }
+
+    def resend_order_to_phone(self, order_id: int, destination_phone: str) -> dict[str, Any]:
+        delivery_info = self._ticket_delivery_service.get_order_delivery_info(order_id)
+        original_phone = str(delivery_info.get("billing_phone") or "").strip()
+        normalized_destination = self._normalize_argentine_phone(destination_phone)
+        masked_destination = mask_phone(normalized_destination or destination_phone)
+
+        if not normalized_destination:
+            self._delivery_state_service.record_manual_resend(
+                order_id,
+                destination_phone=str(destination_phone or "").strip(),
+                original_phone=original_phone or None,
+                normalized_phone=None,
+                sent_tickets=0,
+                status="invalid_phone",
+                error_detail="invalid_phone",
+                metadata_json={"summary": "manual_resend_invalid_phone"},
+            )
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "reason": "invalid_phone",
+                "masked_destination": masked_destination,
+                "normalized_destination": None,
+                "sent_tickets": 0,
+            }
+
+        destination_dir = DEBUG_DIR / f"delivery_manual_{order_id}_{int(time.time())}"
+        prepare_result = self._ticket_delivery_service.prepare_order_tickets(order_id, destination_dir)
+        if not prepare_result.get("ready"):
+            message = str(prepare_result.get("reason") or "Pedido no listo para reenviar.")
+            self._delivery_state_service.record_manual_resend(
+                order_id,
+                destination_phone=str(destination_phone or "").strip(),
+                original_phone=original_phone or None,
+                normalized_phone=normalized_destination,
+                sent_tickets=0,
+                status="not_ready",
+                error_detail=message,
+                metadata_json={
+                    "summary": "manual_resend_not_ready",
+                    "not_ready_reasons": prepare_result.get("not_ready_reasons") or [],
+                },
+            )
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "reason": message,
+                "masked_destination": masked_destination,
+                "normalized_destination": normalized_destination,
+                "sent_tickets": 0,
+                "expected_tickets": int(prepare_result.get("expected_tickets") or 0),
+                "found_tickets": int(prepare_result.get("found_tickets") or 0),
+            }
+
+        ticket_pdfs = prepare_result.get("ticket_pdfs") or []
+        if not ticket_pdfs:
+            self._delivery_state_service.record_manual_resend(
+                order_id,
+                destination_phone=str(destination_phone or "").strip(),
+                original_phone=original_phone or None,
+                normalized_phone=normalized_destination,
+                sent_tickets=0,
+                status="error",
+                error_detail="No hay tickets PDF para reenviar.",
+                metadata_json={"summary": "manual_resend_without_pdfs"},
+            )
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "reason": "No hay tickets PDF para reenviar.",
+                "masked_destination": masked_destination,
+                "normalized_destination": normalized_destination,
+                "sent_tickets": 0,
+                "expected_tickets": int(prepare_result.get("expected_tickets") or 0),
+                "found_tickets": int(prepare_result.get("found_tickets") or 0),
+            }
 
         send_results: list[dict[str, Any]] = []
         total = len(ticket_pdfs)
@@ -399,7 +630,7 @@ class OrderMonitorService:
             if index == 1:
                 caption = f"{self._build_customer_intro_message()}\n\n{caption}"
             ok, detail = self._send_pdf_to_bot(
-                normalized_billing_phone,
+                normalized_destination,
                 pdf_path,
                 pdf_path.name,
                 caption,
@@ -413,61 +644,88 @@ class OrderMonitorService:
                 }
             )
             if not ok:
-                self._delivery_state_service.mark_retryable_error(
+                sent_count = sum(1 for item in send_results if item["ok"])
+                self._delivery_state_service.record_manual_resend(
                     order_id,
-                    payment_method=delivery_info.get("payment_method"),
-                    order_status=delivery_info.get("status"),
-                    expected_tickets=int(prepare_result.get("expected_tickets") or 0),
-                    found_tickets=int(prepare_result.get("found_tickets") or 0),
-                    sent_tickets=sum(1 for item in send_results if item["ok"]),
-                    phone_normalized=normalized_billing_phone,
-                    last_error=detail,
-                    metadata_json={"summary": "document send failed"},
+                    destination_phone=str(destination_phone or "").strip(),
+                    original_phone=original_phone or None,
+                    normalized_phone=normalized_destination,
+                    sent_tickets=sent_count,
+                    status="error",
+                    error_detail=detail,
+                    metadata_json={"summary": "manual_resend_failed"},
                 )
                 return {
                     "ok": False,
                     "order_id": order_id,
-                    "already_sent": False,
                     "reason": detail,
-                    "status": delivery_info.get("status"),
-                    "payment_method": delivery_info.get("payment_method"),
-                    "expected_tickets": prepare_result.get("expected_tickets", 0),
-                    "found_tickets": prepare_result.get("found_tickets", 0),
-                    "sent_tickets": sum(1 for item in send_results if item["ok"]),
-                    "billing_phone_present": billing_phone_present,
-                    "billing_phone_normalizable": True,
-                    "masked_destination": masked_billing_phone,
-                    "state_saved": "retryable_error",
+                    "masked_destination": masked_destination,
+                    "normalized_destination": normalized_destination,
+                    "sent_tickets": sent_count,
+                    "expected_tickets": int(prepare_result.get("expected_tickets") or 0),
+                    "found_tickets": int(prepare_result.get("found_tickets") or 0),
+                    "results": send_results,
                 }
             if index < total:
                 time.sleep(1)
 
-        previous_attempts = int(state.get("attempt_count") or 0) if state else 0
-        self._delivery_state_service.mark_sent(
+        self._delivery_state_service.record_manual_resend(
             order_id,
-            payment_method=delivery_info.get("payment_method"),
-            order_status=delivery_info.get("status"),
-            expected_tickets=int(prepare_result.get("expected_tickets") or 0),
-            found_tickets=int(prepare_result.get("found_tickets") or 0),
+            destination_phone=str(destination_phone or "").strip(),
+            original_phone=original_phone or None,
+            normalized_phone=normalized_destination,
             sent_tickets=total,
-            phone_normalized=normalized_billing_phone,
-            attempt_count=previous_attempts + 1,
-            last_error=None,
-            metadata_json={"summary": "live send"},
+            status="sent",
+            error_detail=None,
+            metadata_json={"summary": "manual_resend_sent"},
         )
         return {
             "ok": True,
             "order_id": order_id,
-            "already_sent": False,
-            "status": delivery_info.get("status"),
-            "payment_method": delivery_info.get("payment_method"),
-            "expected_tickets": prepare_result.get("expected_tickets", 0),
-            "found_tickets": prepare_result.get("found_tickets", 0),
+            "normalized_destination": normalized_destination,
+            "masked_destination": masked_destination,
             "sent_tickets": total,
-            "billing_phone_present": billing_phone_present,
-            "billing_phone_normalizable": True,
-            "masked_destination": masked_billing_phone,
-            "state_saved": "sent",
+            "expected_tickets": int(prepare_result.get("expected_tickets") or 0),
+            "found_tickets": int(prepare_result.get("found_tickets") or 0),
+            "results": send_results,
+        }
+
+    def confirm_pending_customer_deliveries(self, phone: str, message: str) -> dict[str, Any]:
+        normalized_phone = self._normalize_argentine_phone(phone)
+        if not normalized_phone:
+            return {"handled": False, "reason": "invalid_phone"}
+        if not self._is_affirmative_message(message):
+            return {"handled": False, "reason": "not_affirmative"}
+
+        pending_orders = self._delivery_state_service.list_pending_customer_confirmations(
+            normalized_phone
+        )
+        if not pending_orders:
+            return {"handled": False, "reason": "no_pending_deliveries"}
+
+        results: list[dict[str, Any]] = []
+        sent_orders = 0
+        sent_tickets = 0
+        for pending in pending_orders:
+            order_id = int(pending.get("order_id") or 0)
+            result = self._deliver_confirmed_order_to_customer(order_id, normalized_phone)
+            results.append(result)
+            if result.get("ok"):
+                sent_orders += 1
+                sent_tickets += int(result.get("sent_tickets") or 0)
+
+        if sent_orders <= 0:
+            return {
+                "handled": True,
+                "reply": "Todavia no pude enviarte las entradas. Intenta de nuevo en unos minutos, por favor.",
+                "results": results,
+            }
+
+        plural = "s" if sent_orders != 1 else ""
+        return {
+            "handled": True,
+            "reply": f"Listo. Ya te enviamos {sent_tickets} entrada(s) correspondiente{plural} a {sent_orders} compra(s).",
+            "results": results,
         }
 
     def _fetch_order_pages(
@@ -476,13 +734,18 @@ class OrderMonitorService:
         page_size: int,
         limit: int,
         after_order_id: int | None,
+        after_date: str | None = None,
     ) -> list[dict[str, Any]]:
         seen_ids: set[int] = set()
         orders: list[dict[str, Any]] = []
         page = 1
 
         while True:
-            page_orders = self._woocommerce_client.get_orders(per_page=page_size, page=page)
+            page_orders = self._woocommerce_client.get_orders(
+                per_page=page_size,
+                page=page,
+                after=after_date,
+            )
             if not isinstance(page_orders, list):
                 raise RuntimeError("WooCommerce no devolvio una lista de pedidos recientes.")
             if not page_orders:
@@ -503,14 +766,14 @@ class OrderMonitorService:
 
             if len(page_orders) < page_size:
                 break
-            if after_order_id is None and len(orders) >= limit:
+            if after_order_id is None and after_date is None and len(orders) >= limit:
                 break
             if after_order_id is not None and valid_page_ids and all(order_id <= after_order_id for order_id in valid_page_ids):
                 break
             page += 1
 
         orders.sort(key=lambda order: self._safe_order_id(order))
-        if after_order_id is None:
+        if after_order_id is None and after_date is None:
             return orders[-limit:]
         return orders
 
@@ -847,12 +1110,28 @@ class OrderMonitorService:
         )
 
     def _live_single_order(self, order: dict[str, Any]) -> dict[str, Any]:
-        dry_run_result = self._scan_single_order(order, dry_run=True)
         order_id = self._safe_order_id(order)
         payment_method = str(order.get("payment_method") or "")
         delivery_info = self._ticket_delivery_service.get_order_delivery_info(order_id)
         normalized_billing_phone = self._normalize_argentine_phone(delivery_info.get("billing_phone"))
         masked_destination = mask_phone(normalized_billing_phone or delivery_info.get("billing_phone"))
+        previous_state = self._delivery_state_service.get_order_state(order_id)
+
+        if previous_state and previous_state.get("status") == "awaiting_customer_confirmation":
+            return self._build_result(
+                order_id,
+                "awaiting_customer_confirmation",
+                "esperando confirmacion del cliente",
+                expected_tickets=int(previous_state.get("expected_tickets") or 0),
+                found_tickets=int(previous_state.get("found_tickets") or 0),
+                phone_valid=bool(normalized_billing_phone),
+                changed=False,
+                payment_method=payment_method,
+                masked_destination=masked_destination,
+                sent_tickets=0,
+            )
+
+        dry_run_result = self._scan_single_order(order, dry_run=True)
 
         if dry_run_result["status"] == "already_sent":
             return {
@@ -895,15 +1174,15 @@ class OrderMonitorService:
         if send_result.get("ok"):
             return self._build_result(
                 order_id,
-                "sent",
-                "enviado a telefono de facturacion",
+                "awaiting_customer_confirmation",
+                "mensaje inicial enviado",
                 expected_tickets=int(send_result.get("expected_tickets") or 0),
                 found_tickets=int(send_result.get("found_tickets") or 0),
                 phone_valid=True,
                 changed=True,
                 payment_method=payment_method,
                 masked_destination=str(send_result.get("masked_destination") or masked_destination),
-                sent_tickets=int(send_result.get("sent_tickets") or 0),
+                sent_tickets=0,
             )
 
         result_status = "retryable_error"
@@ -1028,6 +1307,21 @@ class OrderMonitorService:
         )
 
     @staticmethod
+    def _build_customer_intro_confirmation_message(
+        ticket_pdfs: list[dict[str, Any]],
+        expected_tickets: int,
+    ) -> str:
+        event_name = ""
+        if ticket_pdfs:
+            event_name = str(ticket_pdfs[0].get("event_name") or "").strip()
+        event_line = event_name or "tu evento"
+        return (
+            f"¡Hola! 👋 Somos Bacano Club. Tenemos listas tus entradas para {event_line}.\n\n"
+            f"Compraste {expected_tickets} entrada/s.\n\n"
+            "¿Querés recibirlas por este WhatsApp? Respondé SI y te las enviamos acá."
+        )
+
+    @staticmethod
     def _build_customer_caption(ticket_pdf: dict[str, Any], index: int, total: int) -> str:
         lines = [f"Entrada {index} de {total}"]
         event_name = str(ticket_pdf.get("event_name") or "").strip()
@@ -1071,3 +1365,126 @@ class OrderMonitorService:
             return True, "Documento enviado"
 
         return False, str(data.get("detail") or data.get("error") or "Error desconocido")
+
+    @staticmethod
+    def _send_text_to_bot(phone: str, text: str) -> tuple[bool, str]:
+        payload = {
+            "phone": phone,
+            "text": text,
+        }
+        try:
+            response = requests.post(
+                "http://127.0.0.1:3000/internal/send-text",
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+        except requests.RequestException:
+            return (
+                False,
+                "El bot principal debe estar encendido y escuchando en http://127.0.0.1:3000.",
+            )
+
+        try:
+            data = response.json()
+        except ValueError:
+            return False, "El bot principal devolvio una respuesta no JSON."
+
+        if response.ok and data.get("ok"):
+            return True, "Texto enviado"
+        return False, str(data.get("detail") or data.get("error") or "Error desconocido")
+
+    @staticmethod
+    def _is_affirmative_message(message: str) -> bool:
+        normalized = (
+            str(message or "")
+            .strip()
+            .lower()
+            .replace("í", "i")
+            .replace("ì", "i")
+            .replace("ï", "i")
+        )
+        return normalized == "si"
+
+    def _deliver_confirmed_order_to_customer(
+        self,
+        order_id: int,
+        normalized_phone: str,
+    ) -> dict[str, Any]:
+        delivery_info = self._ticket_delivery_service.get_order_delivery_info(order_id)
+        if self._delivery_state_service.has_been_sent(order_id):
+            return {"ok": False, "order_id": order_id, "reason": "already_sent", "sent_tickets": 0}
+
+        destination_dir = DEBUG_DIR / f"delivery_live_confirmed_{order_id}"
+        prepare_result = self._ticket_delivery_service.prepare_order_tickets(order_id, destination_dir)
+        if not prepare_result.get("ready"):
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "reason": prepare_result.get("reason") or "Pedido no listo para enviar.",
+                "sent_tickets": 0,
+            }
+
+        ticket_pdfs = prepare_result.get("ticket_pdfs") or []
+        if not ticket_pdfs:
+            return {"ok": False, "order_id": order_id, "reason": "No hay tickets PDF para enviar.", "sent_tickets": 0}
+
+        self._delivery_state_service.mark_sending(
+            order_id,
+            payment_method=delivery_info.get("payment_method"),
+            order_status=delivery_info.get("status"),
+            expected_tickets=int(prepare_result.get("expected_tickets") or 0),
+            found_tickets=int(prepare_result.get("found_tickets") or 0),
+            phone_normalized=normalized_phone,
+            metadata_json={"summary": "sending_live_confirmation"},
+        )
+
+        total = len(ticket_pdfs)
+        sent_results: list[dict[str, Any]] = []
+        for index, ticket_pdf in enumerate(ticket_pdfs, start=1):
+            pdf_path = Path(ticket_pdf["pdf_path"])
+            caption = self._build_customer_caption(ticket_pdf, index, total)
+            if index == 1:
+                caption = f"{self._build_customer_intro_message()}\n\n{caption}"
+            ok, detail = self._send_pdf_to_bot(
+                normalized_phone,
+                pdf_path,
+                pdf_path.name,
+                caption,
+            )
+            sent_results.append({"index": index, "ok": ok, "detail": detail})
+            if not ok:
+                self._delivery_state_service.mark_retryable_error(
+                    order_id,
+                    payment_method=delivery_info.get("payment_method"),
+                    order_status=delivery_info.get("status"),
+                    expected_tickets=int(prepare_result.get("expected_tickets") or 0),
+                    found_tickets=int(prepare_result.get("found_tickets") or 0),
+                    sent_tickets=sum(1 for item in sent_results if item["ok"]),
+                    phone_normalized=normalized_phone,
+                    last_error=detail,
+                    metadata_json={"summary": "document send failed after confirmation"},
+                )
+                return {
+                    "ok": False,
+                    "order_id": order_id,
+                    "reason": detail,
+                    "sent_tickets": sum(1 for item in sent_results if item["ok"]),
+                }
+            if index < total:
+                time.sleep(1)
+
+        current = self._delivery_state_service.get_order_state(order_id) or {}
+        self._delivery_state_service.mark_sent(
+            order_id,
+            payment_method=delivery_info.get("payment_method"),
+            order_status=delivery_info.get("status"),
+            expected_tickets=int(prepare_result.get("expected_tickets") or 0),
+            found_tickets=int(prepare_result.get("found_tickets") or 0),
+            sent_tickets=total,
+            phone_normalized=normalized_phone,
+            attempt_count=int(current.get("attempt_count") or 0) + 1,
+            customer_confirmed_at=DeliveryStateService._now_iso(),
+            last_error=None,
+            metadata_json={"summary": "live send after confirmation"},
+        )
+        return {"ok": True, "order_id": order_id, "sent_tickets": total}

@@ -14,6 +14,7 @@ ALLOWED_STATES = {
     "simulated",
     "sending",
     "sent",
+    "awaiting_customer_confirmation",
     "ignored",
     "waiting",
     "waiting_payment",
@@ -61,6 +62,8 @@ class DeliveryStateService:
             "updated_at": now,
             "sent_at": current["sent_at"] if current else None,
             "attempt_count": current["attempt_count"] if current else 0,
+            "customer_prompted_at": current["customer_prompted_at"] if current else None,
+            "customer_confirmed_at": current["customer_confirmed_at"] if current else None,
             "metadata_json": current["metadata_json"] if current else None,
         }
         merged.update(fields)
@@ -79,8 +82,9 @@ class DeliveryStateService:
                 INSERT INTO ticket_deliveries (
                     order_id, status, payment_method, order_status, expected_tickets,
                     found_tickets, sent_tickets, phone_normalized, last_error,
-                    first_seen_at, updated_at, sent_at, attempt_count, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    first_seen_at, updated_at, sent_at, attempt_count,
+                    customer_prompted_at, customer_confirmed_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     status = excluded.status,
                     payment_method = excluded.payment_method,
@@ -96,6 +100,8 @@ class DeliveryStateService:
                         ELSE excluded.sent_at
                     END,
                     attempt_count = excluded.attempt_count,
+                    customer_prompted_at = COALESCE(ticket_deliveries.customer_prompted_at, excluded.customer_prompted_at),
+                    customer_confirmed_at = COALESCE(excluded.customer_confirmed_at, ticket_deliveries.customer_confirmed_at),
                     metadata_json = excluded.metadata_json
                 """,
                 (
@@ -112,6 +118,8 @@ class DeliveryStateService:
                     merged["updated_at"],
                     merged["sent_at"],
                     merged["attempt_count"],
+                    merged["customer_prompted_at"],
+                    merged["customer_confirmed_at"],
                     merged["metadata_json"],
                 ),
             )
@@ -151,6 +159,20 @@ class DeliveryStateService:
         sent_at = current["sent_at"] if current and current.get("sent_at") else self._now_iso()
         return self.upsert_order_state(order_id, status="sent", sent_at=sent_at, **fields)
 
+    def mark_awaiting_customer_confirmation(self, order_id: int, **fields: Any) -> dict[str, Any]:
+        current = self.get_order_state(order_id)
+        prompted_at = (
+            current["customer_prompted_at"]
+            if current and current.get("customer_prompted_at")
+            else self._now_iso()
+        )
+        return self.upsert_order_state(
+            order_id,
+            status="awaiting_customer_confirmation",
+            customer_prompted_at=prompted_at,
+            **fields,
+        )
+
     def mark_ready(self, order_id: int, **fields: Any) -> dict[str, Any]:
         return self.upsert_order_state(order_id, status="ready", **fields)
 
@@ -189,11 +211,104 @@ class DeliveryStateService:
         state = self.get_order_state(order_id)
         return bool(state and (state.get("status") == "sent" or state.get("sent_at")))
 
-    def list_recent(self, limit: int = 50) -> list[dict[str, Any]]:
+    def list_recent(
+        self,
+        limit: int = 50,
+        *,
+        status: str | None = None,
+        order_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if status:
+            where_clauses.append("status = ?")
+            params.append(status)
+        if order_id is not None:
+            where_clauses.append("order_id = ?")
+            params.append(order_id)
+
+        where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM ticket_deliveries ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
+                f"SELECT * FROM ticket_deliveries {where_sql} ORDER BY updated_at DESC LIMIT ?",
+                (*params, limit),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def record_manual_resend(
+        self,
+        order_id: int,
+        *,
+        destination_phone: str,
+        original_phone: str | None,
+        normalized_phone: str | None,
+        sent_tickets: int,
+        status: str,
+        error_detail: str | None = None,
+        metadata_json: dict[str, Any] | str | None = None,
+    ) -> dict[str, Any]:
+        created_at = self._now_iso()
+        payload = metadata_json
+        if payload is not None and not isinstance(payload, str):
+            payload = json.dumps(payload, ensure_ascii=False)
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO ticket_manual_resends (
+                    order_id, destination_phone, original_phone, normalized_phone,
+                    sent_tickets, status, error_detail, created_at, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    order_id,
+                    destination_phone,
+                    original_phone,
+                    normalized_phone,
+                    sent_tickets,
+                    status,
+                    error_detail,
+                    created_at,
+                    payload,
+                ),
+            )
+            conn.commit()
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM ticket_manual_resends
+                WHERE order_id = ? AND created_at = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (order_id, created_at),
+            ).fetchone()
+        return self._row_to_dict(row) if row else {}
+
+    def list_manual_resends(self, order_id: int, limit: int = 20) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ticket_manual_resends
+                WHERE order_id = ?
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                (order_id, limit),
+            ).fetchall()
+        return [self._row_to_dict(row) for row in rows]
+
+    def list_pending_customer_confirmations(self, normalized_phone: str) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM ticket_deliveries
+                WHERE status = 'awaiting_customer_confirmation'
+                  AND phone_normalized = ?
+                ORDER BY customer_prompted_at ASC, order_id ASC
+                """,
+                (normalized_phone,),
             ).fetchall()
         return [self._row_to_dict(row) for row in rows]
 
@@ -216,10 +331,36 @@ class DeliveryStateService:
                     updated_at TEXT NOT NULL,
                     sent_at TEXT,
                     attempt_count INTEGER DEFAULT 0,
+                    customer_prompted_at TEXT,
+                    customer_confirmed_at TEXT,
                     metadata_json TEXT
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ticket_manual_resends (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    order_id INTEGER NOT NULL,
+                    destination_phone TEXT NOT NULL,
+                    original_phone TEXT,
+                    normalized_phone TEXT,
+                    sent_tickets INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL,
+                    error_detail TEXT,
+                    created_at TEXT NOT NULL,
+                    metadata_json TEXT
+                )
+                """
+            )
+            existing_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(ticket_deliveries)").fetchall()
+            }
+            if "customer_prompted_at" not in existing_columns:
+                conn.execute("ALTER TABLE ticket_deliveries ADD COLUMN customer_prompted_at TEXT")
+            if "customer_confirmed_at" not in existing_columns:
+                conn.execute("ALTER TABLE ticket_deliveries ADD COLUMN customer_confirmed_at TEXT")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:

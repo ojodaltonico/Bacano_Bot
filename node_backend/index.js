@@ -163,6 +163,63 @@ async function handleInternalSendDocument(req, res) {
     })
 }
 
+async function handleInternalSendText(req, res) {
+    if (!isLocalRequest(req)) {
+        sendJson(res, 403, { ok: false, error: "Acceso no permitido" })
+        return
+    }
+
+    if (!activeSock) {
+        sendJson(res, 503, { ok: false, error: "Conexion de WhatsApp no disponible" })
+        return
+    }
+
+    let rawBody = ""
+    req.on("data", (chunk) => {
+        rawBody += chunk
+        if (rawBody.length > 1024 * 1024) {
+            req.destroy()
+        }
+    })
+
+    req.on("end", async () => {
+        try {
+            const payload = JSON.parse(rawBody || "{}")
+            const phone = String(payload.phone || "").trim()
+            const text = String(payload.text || "").trim()
+
+            if (!isDigitsOnly(phone)) {
+                sendJson(res, 400, { ok: false, error: "Telefono invalido" })
+                return
+            }
+
+            if (!text) {
+                sendJson(res, 400, { ok: false, error: "Texto invalido" })
+                return
+            }
+
+            const jid = `${phone}@s.whatsapp.net`
+            const lookup = await activeSock.onWhatsApp(jid)
+            const numberValid =
+                Array.isArray(lookup) && lookup.length > 0 && Boolean(lookup[0]?.exists)
+
+            if (!numberValid) {
+                sendJson(res, 400, { ok: false, error: "Numero no registrado en WhatsApp" })
+                return
+            }
+
+            await activeSock.sendMessage(jid, { text })
+            sendJson(res, 200, { ok: true, message: "Texto enviado" })
+        } catch (error) {
+            sendJson(res, 500, { ok: false, error: error.message || "Error interno" })
+        }
+    })
+
+    req.on("error", () => {
+        sendJson(res, 500, { ok: false, error: "Error leyendo la solicitud" })
+    })
+}
+
 function ensureInternalServer() {
     if (internalServerStarted) {
         return
@@ -171,6 +228,10 @@ function ensureInternalServer() {
     const server = http.createServer((req, res) => {
         if (req.method === "POST" && req.url === "/internal/send-document") {
             handleInternalSendDocument(req, res)
+            return
+        }
+        if (req.method === "POST" && req.url === "/internal/send-text") {
+            handleInternalSendText(req, res)
             return
         }
 

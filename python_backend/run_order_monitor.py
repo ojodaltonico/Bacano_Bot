@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from services.order_monitor_service import OrderMonitorService
+from services.ticket_settings_service import TicketSettingsService
 
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
@@ -50,6 +51,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Habilita envio real a telefonos de facturacion.",
     )
     parser.add_argument(
+        "--use-settings",
+        action="store_true",
+        help="Usa los controles operativos guardados por la GUI.",
+    )
+    parser.add_argument(
         "--test-phone",
         type=str,
         help="Telefono de prueba en formato internacional solo digitos.",
@@ -67,6 +73,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error(f"--interval debe ser de al menos {MIN_INTERVAL} segundos.")
     if args.live and args.live_test:
         parser.error("--live y --live-test no pueden usarse al mismo tiempo.")
+    if args.use_settings and (args.live or args.live_test):
+        parser.error("--use-settings no puede combinarse con --live ni --live-test.")
     if args.live_test:
         if not args.test_phone:
             parser.error("--live-test requiere --test-phone.")
@@ -83,6 +91,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error("--test-phone no se usa en modo --live.")
         if int(args.after_order_id) < 0:
             parser.error("--after-order-id debe ser un entero no negativo.")
+    elif args.use_settings:
+        if args.test_phone or args.after_order_id:
+            parser.error("--use-settings toma telefono y limites desde SQLite.")
     elif args.test_phone or args.after_order_id:
         parser.error("--test-phone y --after-order-id solo se usan junto con --live-test o --live.")
 
@@ -328,10 +339,77 @@ def run_live_cycle(
     return True
 
 
+def run_configured_cycle(
+    service: OrderMonitorService,
+    limit: int,
+    logger: logging.Logger,
+) -> bool:
+    print(f"[{timestamp_now()}] Revisando pedidos configurados...")
+    logger.info("Iniciando ciclo configurado. limit=%s", limit)
+
+    try:
+        result = service.scan_configured_orders(limit=limit)
+    except Exception as exc:
+        safe_message = str(exc) or "Error desconocido."
+        print(f"Error del monitor configurado: {safe_message}")
+        logger.error("Fallo en ciclo configurado: %s", safe_message)
+        return False
+
+    summary = result["summary"]
+    mode = str(result.get("mode") or "desconocido")
+    reason = str(result.get("reason") or "").strip()
+    print(
+        f"Modo: {mode} | Analizados: {summary['analyzed']} | enviados: {summary['sent']} | "
+        f"simulados: {summary['simulated']} | ignorados: {summary['ignored']} | "
+        f"esperando: {summary['waiting']} | errores: {summary['errors']} | ya enviados: {summary['already_sent']}"
+    )
+    if reason:
+        print(f"Motivo: {reason}")
+
+    changed_items = [item for item in result["results"] if item.get("changed")]
+    if changed_items:
+        logger.info(
+            "Ciclo configurado completado. mode=%s analyzed=%s sent=%s simulated=%s ignored=%s waiting=%s errors=%s already_sent=%s changed=%s",
+            mode,
+            summary["analyzed"],
+            summary["sent"],
+            summary["simulated"],
+            summary["ignored"],
+            summary["waiting"],
+            summary["errors"],
+            summary["already_sent"],
+            len(changed_items),
+        )
+        for item in changed_items:
+            logger.info(
+                "Pedido %s | %s | %s | tickets %s/%s",
+                item.get("order_id"),
+                item.get("status"),
+                item.get("summary"),
+                item.get("found_tickets", 0),
+                item.get("expected_tickets", 0),
+            )
+    else:
+        print("Sin pedidos nuevos o cambios relevantes.")
+        logger.info(
+            "Ciclo configurado sin cambios. mode=%s analyzed=%s sent=%s simulated=%s ignored=%s waiting=%s errors=%s already_sent=%s",
+            mode,
+            summary["analyzed"],
+            summary["sent"],
+            summary["simulated"],
+            summary["ignored"],
+            summary["waiting"],
+            summary["errors"],
+            summary["already_sent"],
+        )
+    return True
+
+
 def main() -> None:
     args = parse_args(sys.argv[1:])
     logger = setup_logger()
     service = OrderMonitorService()
+    settings_service = TicketSettingsService() if args.use_settings else None
 
     if args.live:
         print("MODO REAL DE ENVIO")
@@ -351,6 +429,10 @@ def main() -> None:
             "Monitor iniciado en modo live-test. after_order_id=%s",
             args.after_order_id,
         )
+    elif args.use_settings:
+        print("MODO CONFIGURADO")
+        print("Se aplicaran los controles guardados por la GUI de Entradas.")
+        logger.info("Monitor iniciado en modo configurado.")
     else:
         logger.info("Monitor iniciado en modo simulacion.")
 
@@ -358,7 +440,9 @@ def main() -> None:
         if args.live:
             time.sleep(10)
         while True:
-            if args.live:
+            if args.use_settings:
+                run_configured_cycle(service, args.limit, logger)
+            elif args.live:
                 run_live_cycle(
                     service,
                     args.limit,
@@ -377,8 +461,9 @@ def main() -> None:
                 run_cycle(service, args.limit, logger)
             if args.once:
                 break
-            print(f"Proxima revision en {args.interval} segundos.")
-            time.sleep(args.interval)
+            interval = int(settings_service.get_settings()["monitor_interval"]) if settings_service else args.interval
+            print(f"Proxima revision en {interval} segundos.")
+            time.sleep(interval)
     except KeyboardInterrupt:
         print("Monitor detenido por el usuario.")
         logger.info("Monitor detenido por Ctrl+C.")

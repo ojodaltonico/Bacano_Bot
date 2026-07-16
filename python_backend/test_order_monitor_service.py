@@ -49,11 +49,20 @@ class FakeWooCommerceClient:
     def __init__(self, pages: dict[int, list[dict]]) -> None:
         self.pages = pages
         self.requested_pages: list[int] = []
+        self.orders_by_id = {
+            int(order["id"]): order
+            for page in pages.values()
+            for order in page
+            if isinstance(order, dict) and order.get("id") is not None
+        }
 
     def get_orders(self, **kwargs):
         page = int(kwargs.get("page", 1))
         self.requested_pages.append(page)
         return self.pages.get(page, [])
+
+    def get_order(self, order_id: int):
+        return self.orders_by_id[order_id]
 
 
 class FakeTicketDeliveryService:
@@ -76,6 +85,7 @@ class FakeDeliveryStateService:
     def __init__(self) -> None:
         self.states: dict[int, dict] = {}
         self.calls: list[tuple[str, int, dict]] = []
+        self.manual_resends: list[dict] = []
 
     def get_order_state(self, order_id: int):
         return self.states.get(order_id)
@@ -130,6 +140,32 @@ class FakeDeliveryStateService:
 
     def mark_sent(self, order_id: int, **fields):
         return self._set("mark_sent", order_id, "sent", sent_at="2026-07-15T12:00:00+00:00", **fields)
+
+    def mark_awaiting_customer_confirmation(self, order_id: int, **fields):
+        return self._set(
+            "mark_awaiting_customer_confirmation",
+            order_id,
+            "awaiting_customer_confirmation",
+            customer_prompted_at="2026-07-16T10:00:00+00:00",
+            **fields,
+        )
+
+    def record_manual_resend(self, order_id: int, **fields):
+        payload = {"order_id": order_id, **fields}
+        self.manual_resends.append(payload)
+        return payload
+
+    def list_manual_resends(self, order_id: int, limit: int = 20):
+        rows = [row for row in self.manual_resends if row["order_id"] == order_id]
+        return rows[:limit]
+
+    def list_pending_customer_confirmations(self, normalized_phone: str):
+        return [
+            {"order_id": order_id, **state}
+            for order_id, state in self.states.items()
+            if state.get("status") == "awaiting_customer_confirmation"
+            and state.get("phone_normalized") == normalized_phone
+        ]
 
 
 class OrderMonitorServiceTests(unittest.TestCase):
@@ -364,6 +400,226 @@ class OrderMonitorServiceTests(unittest.TestCase):
         service.scan_recent_orders(limit=20, dry_run=True)
 
         self.assertEqual(delivery.prepare_calls, [50000, 50000])
+
+    def test_configured_mode_respects_test_priority(self):
+        order = ticket_order()
+        delivery_info = {
+            50000: {
+                "billing_phone": "2939407879",
+                "expected_tickets": 2,
+                "not_ready_reasons": [],
+                "status": "processing",
+                "payment_method": "woo-mercado-pago-custom",
+            }
+        }
+        prepare = {
+            50000: {
+                "ready": True,
+                "expected_tickets": 2,
+                "found_tickets": 2,
+                "ticket_pdfs": [],
+            }
+        }
+        service, _, _, _ = self.make_service(
+            pages={1: [order]},
+            delivery_info=delivery_info,
+            prepare=prepare,
+        )
+
+        class Settings:
+            def get_settings(self_inner):
+                return {
+                    "monitor_enabled": True,
+                    "test_mode": True,
+                    "auto_send_customer": True,
+                    "test_phone": "5491111111111",
+                    "monitor_after_order_id": 49999,
+                    "monitor_after_date": None,
+                }
+
+        service._settings_service = Settings()
+        service.send_order_for_test = lambda order_id, test_phone, force=False: {
+            "ok": True,
+            "order_id": order_id,
+            "expected_tickets": 2,
+            "found_tickets": 2,
+            "sent_tickets": 2,
+            "billing_phone_present": True,
+            "billing_phone_normalizable": True,
+            "masked_real_destination": "********7879",
+        }
+        service.send_order_to_customer = lambda order_id: {"ok": False, "reason": "should_not_happen"}
+
+        result = service.scan_configured_orders(limit=20)
+
+        self.assertEqual(result["mode"], "live-test")
+        self.assertEqual(result["summary"]["sent"], 1)
+
+    def test_configured_mode_off_does_not_query_orders(self):
+        service, woo, _, _ = self.make_service(pages={})
+
+        class Settings:
+            def get_settings(self_inner):
+                return {
+                    "monitor_enabled": False,
+                    "test_mode": True,
+                    "auto_send_customer": False,
+                    "test_phone": None,
+                    "monitor_after_order_id": None,
+                    "monitor_after_date": None,
+                }
+
+        service._settings_service = Settings()
+        result = service.scan_configured_orders(limit=20)
+        self.assertEqual(result["mode"], "disabled")
+        self.assertEqual(woo.requested_pages, [])
+
+    def test_manual_resend_does_not_alter_original_sent_state(self):
+        order = ticket_order()
+        delivery_info = {
+            50000: {
+                "billing_phone": "2939407879",
+                "expected_tickets": 2,
+                "status": "processing",
+                "payment_method": "woo-mercado-pago-custom",
+            }
+        }
+        prepare = {
+            50000: {
+                "ready": True,
+                "expected_tickets": 2,
+                "found_tickets": 2,
+                "ticket_pdfs": [
+                    {"pdf_path": "C:/tmp/ticket-1.pdf", "event_name": "Bacano", "ticket_type": "General"},
+                    {"pdf_path": "C:/tmp/ticket-2.pdf", "event_name": "Bacano", "ticket_type": "General"},
+                ],
+            }
+        }
+        state = FakeDeliveryStateService()
+        state.states[50000] = {
+            "status": "sent",
+            "sent_at": "2026-07-16T11:05:41+00:00",
+            "expected_tickets": 2,
+            "found_tickets": 2,
+            "sent_tickets": 2,
+            "phone_normalized": "5492939407879",
+        }
+        service, _, _, _ = self.make_service(
+            pages={1: [order]},
+            delivery_info=delivery_info,
+            prepare=prepare,
+            state_service=state,
+        )
+
+        original_sender = OrderMonitorService._send_pdf_to_bot
+        OrderMonitorService._send_pdf_to_bot = staticmethod(lambda *_args: (True, "Documento enviado"))
+        try:
+            result = service.resend_order_to_phone(50000, "02923 40-7879")
+        finally:
+            OrderMonitorService._send_pdf_to_bot = original_sender
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(state.states[50000]["status"], "sent")
+        self.assertEqual(state.states[50000]["sent_at"], "2026-07-16T11:05:41+00:00")
+        self.assertEqual(len(state.manual_resends), 1)
+        self.assertEqual(state.manual_resends[0]["normalized_phone"], "5492923407879")
+
+    def test_live_message_initial_is_sent_once_without_pdfs(self):
+        order = ticket_order()
+        delivery_info = {
+            50000: {
+                "billing_phone": "2939407879",
+                "expected_tickets": 2,
+                "status": "processing",
+                "payment_method": "woo-mercado-pago-custom",
+                "not_ready_reasons": [],
+            }
+        }
+        prepare = {
+            50000: {
+                "ready": True,
+                "expected_tickets": 2,
+                "found_tickets": 2,
+                "ticket_pdfs": [
+                    {"pdf_path": "C:/tmp/ticket-1.pdf", "event_name": "Bacano Fest", "ticket_type": "General"}
+                ],
+            }
+        }
+        service, _, _, state = self.make_service(
+            pages={1: [order]},
+            delivery_info=delivery_info,
+            prepare=prepare,
+        )
+        sent_texts = []
+        sent_pdfs = []
+        original_text = OrderMonitorService._send_text_to_bot
+        original_pdf = OrderMonitorService._send_pdf_to_bot
+        OrderMonitorService._send_text_to_bot = staticmethod(lambda phone, text: (sent_texts.append((phone, text)) or True, "Texto enviado"))
+        OrderMonitorService._send_pdf_to_bot = staticmethod(lambda *args: (sent_pdfs.append(args) or True, "Documento enviado"))
+        try:
+            first = service.live_recent_orders(limit=20, after_order_id=49999)
+            second = service.live_recent_orders(limit=20, after_order_id=49999)
+        finally:
+            OrderMonitorService._send_text_to_bot = original_text
+            OrderMonitorService._send_pdf_to_bot = original_pdf
+
+        self.assertEqual(first["results"][0]["status"], "awaiting_customer_confirmation")
+        self.assertEqual(second["results"][0]["status"], "awaiting_customer_confirmation")
+        self.assertEqual(len(sent_texts), 1)
+        self.assertEqual(len(sent_pdfs), 0)
+        self.assertEqual(state.states[50000]["status"], "awaiting_customer_confirmation")
+
+    def test_affirmative_si_triggers_pending_delivery(self):
+        order = ticket_order()
+        delivery_info = {
+            50000: {
+                "billing_phone": "2939407879",
+                "expected_tickets": 2,
+                "status": "processing",
+                "payment_method": "woo-mercado-pago-custom",
+                "not_ready_reasons": [],
+            }
+        }
+        prepare = {
+            50000: {
+                "ready": True,
+                "expected_tickets": 2,
+                "found_tickets": 2,
+                "ticket_pdfs": [
+                    {"pdf_path": "C:/tmp/ticket-1.pdf", "event_name": "Bacano Fest", "ticket_type": "General"},
+                    {"pdf_path": "C:/tmp/ticket-2.pdf", "event_name": "Bacano Fest", "ticket_type": "General"},
+                ],
+            }
+        }
+        state = FakeDeliveryStateService()
+        state.states[50000] = {
+            "status": "awaiting_customer_confirmation",
+            "phone_normalized": "5492939407879",
+            "expected_tickets": 2,
+            "found_tickets": 2,
+        }
+        service, _, _, state = self.make_service(
+            pages={1: [order]},
+            delivery_info=delivery_info,
+            prepare=prepare,
+            state_service=state,
+        )
+        sent_pdfs = []
+        original_pdf = OrderMonitorService._send_pdf_to_bot
+        OrderMonitorService._send_pdf_to_bot = staticmethod(lambda *args: (sent_pdfs.append(args) or True, "Documento enviado"))
+        try:
+            result = service.confirm_pending_customer_deliveries("5492939407879", "SI")
+        finally:
+            OrderMonitorService._send_pdf_to_bot = original_pdf
+
+        self.assertTrue(result["handled"])
+        self.assertEqual(state.states[50000]["status"], "sent")
+        self.assertEqual(len(sent_pdfs), 2)
+
+    def test_non_affirmative_message_does_not_trigger_delivery(self):
+        service, _, _, _ = self.make_service(pages={})
+        result = service.confirm_pending_customer_deliveries("5492939407879", "tal vez")
+        self.assertFalse(result["handled"])
 
 
 if __name__ == "__main__":
