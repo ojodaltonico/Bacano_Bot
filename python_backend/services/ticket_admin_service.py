@@ -7,6 +7,7 @@ from integrations.woocommerce_client import WooCommerceClient
 from services.delivery_state_service import DeliveryStateService
 from services.order_monitor_service import DEBUG_DIR, OrderMonitorService
 from services.ticket_delivery_service import TicketDeliveryService
+from services.ticket_settings_service import TicketSettingsService
 from utils.phone_utils import mask_phone, normalize_argentine_phone
 
 
@@ -33,10 +34,14 @@ class TicketAdminService:
         woocommerce_client: WooCommerceClient | None = None,
         ticket_delivery_service: TicketDeliveryService | None = None,
         order_monitor_service: OrderMonitorService | None = None,
+        ticket_settings_service: TicketSettingsService | None = None,
     ) -> None:
         self._delivery_state_service = delivery_state_service or DeliveryStateService()
         self._woocommerce_client = woocommerce_client or WooCommerceClient()
         self._ticket_delivery_service = ticket_delivery_service or TicketDeliveryService()
+        self._ticket_settings_service = ticket_settings_service or TicketSettingsService(
+            self._delivery_state_service.db_path
+        )
         self._order_monitor_service = order_monitor_service or OrderMonitorService(
             woocommerce_client=self._woocommerce_client,
             ticket_delivery_service=self._ticket_delivery_service,
@@ -50,12 +55,16 @@ class TicketAdminService:
         status: str = "Todos",
         order_id: int | None = None,
         show_ignored: bool = False,
+        operational_only: bool = True,
     ) -> list[dict[str, Any]]:
         raw_status = None if status == "Todos" else self._status_from_visible(status)
+        settings = self._ticket_settings_service.get_settings() if operational_only else {}
         states = self._delivery_state_service.list_recent(
             limit=limit,
             status=raw_status,
             order_id=order_id,
+            after_order_id=settings.get("monitor_after_order_id"),
+            after_date=settings.get("monitor_after_date"),
         )
         rows: list[dict[str, Any]] = []
         for state in states:
@@ -132,16 +141,14 @@ class TicketAdminService:
 
     def _build_row(self, state: dict[str, Any]) -> dict[str, Any]:
         order_id = int(state.get("order_id") or 0)
-        order = self._woocommerce_client.get_order(order_id)
-        billing = order.get("billing") or {}
-        original_phone = str(billing.get("phone") or "").strip()
+        original_phone = str(state.get("original_phone") or "").strip()
         normalized_phone = str(state.get("phone_normalized") or normalize_argentine_phone(original_phone) or "")
         found = int(state.get("found_tickets") or 0)
         sent = int(state.get("sent_tickets") or 0)
         return {
             "order_id": order_id,
-            "date": str(order.get("date_created") or state.get("first_seen_at") or ""),
-            "client_name": self._build_client_name(billing),
+            "date": str(state.get("order_date") or state.get("first_seen_at") or ""),
+            "client_name": str(state.get("client_name") or "-"),
             "original_phone": original_phone,
             "normalized_phone": normalized_phone,
             "expected_tickets": int(state.get("expected_tickets") or 0),

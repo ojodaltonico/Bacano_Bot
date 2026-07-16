@@ -114,6 +114,9 @@ class OrderMonitorService:
         results: list[dict[str, Any]] = []
 
         for order in orders:
+            order_id = self._safe_order_id(order)
+            if after_order_id is not None and order_id <= after_order_id:
+                continue
             try:
                 result = self._scan_single_order(order, dry_run=dry_run)
             except Exception as exc:
@@ -775,6 +778,11 @@ class OrderMonitorService:
         orders.sort(key=lambda order: self._safe_order_id(order))
         if after_order_id is None and after_date is None:
             return orders[-limit:]
+        if after_order_id is not None:
+            orders = [
+                order for order in orders
+                if self._safe_order_id(order) > after_order_id
+            ]
         return orders
 
     def _scan_single_order(self, order: dict[str, Any], dry_run: bool) -> dict[str, Any]:
@@ -784,6 +792,13 @@ class OrderMonitorService:
         meta = meta_to_map(order.get("meta_data"))
         ticket_order = evaluate_ticket_order(order, meta)
         previous_state = self._delivery_state_service.get_order_state(order_id)
+        billing = order.get("billing") or {}
+        client_name = " ".join(
+            part for part in (
+                str(billing.get("first_name") or "").strip(),
+                str(billing.get("last_name") or "").strip(),
+            ) if part
+        ).strip() or "-"
 
         if self._delivery_state_service.has_been_sent(order_id):
             return self._build_result(
@@ -798,6 +813,9 @@ class OrderMonitorService:
             payment_method=payment_method,
             order_status=order_status,
             expected_tickets=int(ticket_order.get("expected_tickets") or 0),
+            order_date=str(order.get("date_created") or ""),
+            client_name=client_name,
+            original_phone=str(billing.get("phone") or "").strip(),
             metadata_json={"summary": "detected"},
         )
 
@@ -913,6 +931,15 @@ class OrderMonitorService:
             and int(previous_state.get("found_tickets") or 0) >= expected_tickets
             and phone_valid == bool(previous_state.get("phone_normalized"))
         ):
+            self._delivery_state_service.mark_simulated(
+                order_id,
+                payment_method=payment_method,
+                order_status=order_status,
+                expected_tickets=expected_tickets,
+                found_tickets=int(previous_state.get("found_tickets") or 0),
+                phone_normalized=previous_state.get("phone_normalized"),
+                metadata_json={"summary": "sin cambios", "phone_valid": phone_valid},
+            )
             return self._build_result(
                 order_id,
                 "simulated",

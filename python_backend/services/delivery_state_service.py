@@ -31,6 +31,10 @@ class DeliveryStateService:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    @property
+    def db_path(self) -> Path:
+        return self._db_path
+
     def get_order_state(self, order_id: int) -> dict[str, Any] | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -57,6 +61,9 @@ class DeliveryStateService:
             "found_tickets": current["found_tickets"] if current else 0,
             "sent_tickets": current["sent_tickets"] if current else 0,
             "phone_normalized": current["phone_normalized"] if current else None,
+            "order_date": current["order_date"] if current else None,
+            "client_name": current["client_name"] if current else None,
+            "original_phone": current["original_phone"] if current else None,
             "last_error": current["last_error"] if current else None,
             "first_seen_at": current["first_seen_at"] if current else now,
             "updated_at": now,
@@ -83,8 +90,9 @@ class DeliveryStateService:
                     order_id, status, payment_method, order_status, expected_tickets,
                     found_tickets, sent_tickets, phone_normalized, last_error,
                     first_seen_at, updated_at, sent_at, attempt_count,
-                    customer_prompted_at, customer_confirmed_at, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    customer_prompted_at, customer_confirmed_at, metadata_json,
+                    order_date, client_name, original_phone
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(order_id) DO UPDATE SET
                     status = excluded.status,
                     payment_method = excluded.payment_method,
@@ -102,7 +110,10 @@ class DeliveryStateService:
                     attempt_count = excluded.attempt_count,
                     customer_prompted_at = COALESCE(ticket_deliveries.customer_prompted_at, excluded.customer_prompted_at),
                     customer_confirmed_at = COALESCE(excluded.customer_confirmed_at, ticket_deliveries.customer_confirmed_at),
-                    metadata_json = excluded.metadata_json
+                    metadata_json = excluded.metadata_json,
+                    order_date = COALESCE(excluded.order_date, ticket_deliveries.order_date),
+                    client_name = COALESCE(excluded.client_name, ticket_deliveries.client_name),
+                    original_phone = COALESCE(excluded.original_phone, ticket_deliveries.original_phone)
                 """,
                 (
                     order_id,
@@ -121,6 +132,9 @@ class DeliveryStateService:
                     merged["customer_prompted_at"],
                     merged["customer_confirmed_at"],
                     merged["metadata_json"],
+                    merged["order_date"],
+                    merged["client_name"],
+                    merged["original_phone"],
                 ),
             )
             conn.commit()
@@ -217,6 +231,8 @@ class DeliveryStateService:
         *,
         status: str | None = None,
         order_id: int | None = None,
+        after_order_id: int | None = None,
+        after_date: str | None = None,
     ) -> list[dict[str, Any]]:
         where_clauses: list[str] = []
         params: list[Any] = []
@@ -226,6 +242,12 @@ class DeliveryStateService:
         if order_id is not None:
             where_clauses.append("order_id = ?")
             params.append(order_id)
+        if after_order_id is not None:
+            where_clauses.append("order_id > ?")
+            params.append(after_order_id)
+        if after_date:
+            where_clauses.append("order_date >= ?")
+            params.append(after_date)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         with self._connect() as conn:
@@ -333,7 +355,10 @@ class DeliveryStateService:
                     attempt_count INTEGER DEFAULT 0,
                     customer_prompted_at TEXT,
                     customer_confirmed_at TEXT,
-                    metadata_json TEXT
+                    metadata_json TEXT,
+                    order_date TEXT,
+                    client_name TEXT,
+                    original_phone TEXT
                 )
                 """
             )
@@ -361,6 +386,12 @@ class DeliveryStateService:
                 conn.execute("ALTER TABLE ticket_deliveries ADD COLUMN customer_prompted_at TEXT")
             if "customer_confirmed_at" not in existing_columns:
                 conn.execute("ALTER TABLE ticket_deliveries ADD COLUMN customer_confirmed_at TEXT")
+            if "order_date" not in existing_columns:
+                conn.execute("ALTER TABLE ticket_deliveries ADD COLUMN order_date TEXT")
+            if "client_name" not in existing_columns:
+                conn.execute("ALTER TABLE ticket_deliveries ADD COLUMN client_name TEXT")
+            if "original_phone" not in existing_columns:
+                conn.execute("ALTER TABLE ticket_deliveries ADD COLUMN original_phone TEXT")
             conn.commit()
 
     def _connect(self) -> sqlite3.Connection:

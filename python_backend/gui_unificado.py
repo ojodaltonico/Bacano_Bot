@@ -53,6 +53,8 @@ class BacanoBotGUI:
         self.ticket_rows = {}
         self.ticket_selected_order_id = None
         self.ticket_detail_data = None
+        self.ticket_refresh_in_progress = False
+        self.ticket_auto_refresh_ms = 30000
 
         self.setup_ui()
 
@@ -666,20 +668,27 @@ class BacanoBotGUI:
         self.ticket_destination_preview.pack(anchor="w")
         self.ticket_destination_entry.bind("<KeyRelease>", self.on_ticket_destination_changed)
 
-        ttk.Label(detail_frame, text="PDFs disponibles:").pack(anchor="w")
-        self.ticket_pdf_list = tk.Listbox(detail_frame, height=5)
-        self.ticket_pdf_list.pack(fill="both", expand=False, pady=(2, 6))
-
         action_frame = ttk.Frame(detail_frame)
         action_frame.pack(fill="x", pady=(0, 6))
-        ttk.Button(action_frame, text="Reenviar tickets", command=self.manual_resend_selected_ticket).pack(side="left")
+        self.ticket_resend_button = ttk.Button(
+            action_frame,
+            text="Reenviar tickets",
+            command=self.manual_resend_selected_ticket,
+        )
+        self.ticket_resend_button.pack(fill="x")
 
-        self.ticket_detail = scrolledtext.ScrolledText(detail_frame, height=9, wrap=tk.WORD)
+        ttk.Label(detail_frame, text="PDFs disponibles:").pack(anchor="w")
+        self.ticket_pdf_list = tk.Listbox(detail_frame, height=3)
+        self.ticket_pdf_list.pack(fill="x", expand=False, pady=(2, 5))
+
+        self.ticket_detail = scrolledtext.ScrolledText(detail_frame, height=5, wrap=tk.WORD)
         self.ticket_detail.pack(fill="both", expand=True)
         self.ticket_detail.insert("1.0", "Selecciona un pedido para ver detalle y reenviar manualmente.")
         self.ticket_detail.config(state="disabled")
 
         self.load_ticket_settings()
+        self.root.after(500, self.refresh_ticket_deliveries)
+        self.root.after(self.ticket_auto_refresh_ms, self.auto_refresh_ticket_deliveries)
 
     def load_ticket_settings(self):
         settings = self.ticket_settings_service.get_settings()
@@ -746,14 +755,19 @@ class BacanoBotGUI:
             messagebox.showerror("Entradas", str(exc))
             return None
 
-    def refresh_ticket_deliveries(self):
+    def refresh_ticket_deliveries(self, silent=False):
+        if self.ticket_refresh_in_progress:
+            return
         raw_order_id = self.ticket_order_search.get().strip()
         if raw_order_id and not raw_order_id.isdigit():
-            messagebox.showerror("Entradas", "El Order ID debe ser numerico.")
+            if not silent:
+                messagebox.showerror("Entradas", "El Order ID debe ser numerico.")
             return
         order_id = int(raw_order_id) if raw_order_id else None
         status = self.ticket_status_filter.get()
-        self.ticket_refresh_status.config(text="Actualizando...")
+        self.ticket_refresh_in_progress = True
+        if not silent:
+            self.ticket_refresh_status.config(text="Actualizando...")
 
         def worker():
             try:
@@ -767,11 +781,13 @@ class BacanoBotGUI:
                 )
                 self.root.after(0, lambda: self.populate_ticket_rows(rows))
             except Exception as exc:
-                self.root.after(0, lambda value=str(exc): self.ticket_refresh_failed(value))
+                self.root.after(0, lambda value=str(exc): self.ticket_refresh_failed(value, silent=silent))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def populate_ticket_rows(self, rows):
+        selected = self.ticket_tree.selection()
+        selected_id = selected[0] if selected else None
         self.ticket_tree.delete(*self.ticket_tree.get_children())
         self.ticket_rows = {int(row["order_id"]): row for row in rows}
         for row in rows:
@@ -787,11 +803,23 @@ class BacanoBotGUI:
                 row.get("last_sent_at") or "-",
                 row.get("last_error") or "-",
             ))
+        if selected_id and self.ticket_tree.exists(selected_id):
+            self.ticket_tree.selection_set(selected_id)
+            self.ticket_tree.focus(selected_id)
         self.ticket_refresh_status.config(text=f"{len(rows)} entrega(s)")
+        self.ticket_refresh_in_progress = False
 
-    def ticket_refresh_failed(self, message):
+    def ticket_refresh_failed(self, message, silent=False):
         self.ticket_refresh_status.config(text="Error")
-        messagebox.showerror("Entradas", message)
+        self.ticket_refresh_in_progress = False
+        if not silent:
+            messagebox.showerror("Entradas", message)
+
+    def auto_refresh_ticket_deliveries(self):
+        try:
+            self.refresh_ticket_deliveries(silent=True)
+        finally:
+            self.root.after(self.ticket_auto_refresh_ms, self.auto_refresh_ticket_deliveries)
 
     def on_ticket_selected(self, _event=None):
         selected = self.ticket_tree.selection()

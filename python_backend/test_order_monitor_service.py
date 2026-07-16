@@ -27,6 +27,12 @@ def ticket_order(
         meta_data.append({"key": "_bacano_operation_type", "value": operation_type})
     return {
         "id": order_id,
+        "date_created": "2026-07-15T12:00:00-03:00",
+        "billing": {
+            "first_name": "Cliente",
+            "last_name": str(order_id),
+            "phone": "2923407879",
+        },
         "payment_method": payment_method,
         "status": status,
         "date_paid": date_paid,
@@ -269,6 +275,33 @@ class OrderMonitorServiceTests(unittest.TestCase):
         self.assertGreaterEqual(len(woo.requested_pages), 2)
         self.assertEqual(sorted(item["order_id"] for item in result["results"]), [50001, 50002, 50003])
 
+    def test_dry_run_never_processes_orders_at_or_before_cutoff(self):
+        recent = ticket_order(50003)
+        old = ticket_order(50000)
+        delivery_info = {
+            50003: {
+                "billing_phone": "5491111111111",
+                "expected_tickets": 2,
+                "not_ready_reasons": [],
+            }
+        }
+        prepare = {50003: {"ready": True, "found_tickets": 2}}
+        service, _, delivery, state = self.make_service(
+            pages={1: [recent, old]},
+            delivery_info=delivery_info,
+            prepare=prepare,
+        )
+
+        result = service.scan_recent_orders(
+            limit=20,
+            dry_run=True,
+            after_order_id=50000,
+        )
+
+        self.assertEqual([item["order_id"] for item in result["results"]], [50003])
+        self.assertNotIn(50000, state.states)
+        self.assertEqual(delivery.prepare_calls, [50003])
+
     def test_retryable_error_is_retried_on_next_cycle(self):
         order = ticket_order()
         delivery_info = {
@@ -370,6 +403,7 @@ class OrderMonitorServiceTests(unittest.TestCase):
 
         self.assertEqual(result["results"][0]["status"], "simulated")
         self.assertFalse(result["results"][0]["changed"])
+        self.assertEqual(state.states[50000]["status"], "simulated")
 
     def test_failed_order_can_be_re_evaluated_later(self):
         order = ticket_order()

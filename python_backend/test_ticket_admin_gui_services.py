@@ -119,6 +119,9 @@ class TicketAdminTests(unittest.TestCase):
             found_tickets=4,
             sent_tickets=4,
             phone_normalized="5492939407879",
+            order_date="2026-07-16T08:05:00-03:00",
+            client_name="Sofia Telll",
+            original_phone="2939407879",
             metadata_json={"summary": "manual test send"},
         )
         woo = FakeWooCommerceClient(
@@ -163,6 +166,9 @@ class TicketAdminTests(unittest.TestCase):
             found_tickets=4,
             sent_tickets=4,
             phone_normalized="5492939407879",
+            order_date="2026-07-16T08:05:00-03:00",
+            client_name="Sofia Telll",
+            original_phone="2939407879",
         )
         woo = FakeWooCommerceClient(
             {
@@ -192,6 +198,35 @@ class TicketAdminTests(unittest.TestCase):
 
         self.assertEqual([row["order_id"] for row in hidden], [39216])
         self.assertEqual(sorted(row["order_id"] for row in visible), [39216, 39221])
+
+    def test_operational_cutoff_filters_local_rows_without_woocommerce_calls(self):
+        db_path = make_temp_db_path("ticket_admin_cutoff")
+        state = DeliveryStateService(db_path)
+        for order_id in (39216, 39237):
+            state.mark_simulated(
+                order_id,
+                payment_method="woo-mercado-pago-custom",
+                order_status="processing",
+                expected_tickets=1,
+                found_tickets=1,
+                order_date="2026-07-16T12:00:00-03:00",
+                client_name=f"Cliente {order_id}",
+                original_phone="2923407879",
+            )
+        settings = TicketSettingsService(db_path)
+        settings.update_settings(monitor_after_order_id=39225)
+        woo = FakeWooCommerceClient({})
+        service = TicketAdminService(
+            delivery_state_service=state,
+            woocommerce_client=woo,
+            ticket_delivery_service=FakeTicketDeliveryService({}, {}),
+            order_monitor_service=FakeOrderMonitorService(),
+            ticket_settings_service=settings,
+        )
+
+        rows = service.list_recent_deliveries()
+
+        self.assertEqual([row["order_id"] for row in rows], [39237])
 
     def test_manual_resend_goes_through_order_monitor_service(self):
         db_path = make_temp_db_path("ticket_admin")
