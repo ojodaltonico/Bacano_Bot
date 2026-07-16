@@ -192,6 +192,33 @@ class BalanceOrderService:
             ).fetchone()
         return dict(row) if row else None
 
+    def list_local_orders(
+        self,
+        *,
+        limit: int = 100,
+        order_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        if limit <= 0 or limit > 500:
+            raise ValueError("limit debe estar entre 1 y 500.")
+        query = "SELECT * FROM balance_orders"
+        params: list[Any] = []
+        if order_id is not None:
+            query += " WHERE woocommerce_order_id = ?"
+            params.append(int(order_id))
+        query += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._connect_sqlite() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_local_load(self, reference: str) -> dict[str, Any] | None:
+        with self._connect_sqlite() as conn:
+            row = conn.execute(
+                "SELECT * FROM balance_loads WHERE reference = ?",
+                (str(reference),),
+            ).fetchone()
+        return dict(row) if row else None
+
     def update_local_order_status(
         self,
         order_id: int,

@@ -123,6 +123,10 @@ class BalancePaymentService:
         alert_required = bool(paid_eval.get("alert_required"))
         return self._attach_admin_alert(result, required=alert_required)
 
+    def get_client_by_id(self, client_id: int) -> dict[str, Any]:
+        """Public read-only lookup used by administrative views."""
+        return self._find_client_by_id(int(client_id))
+
     def _validate_balance_order(self, order: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
         tickera_analysis = self._analyze_tickera_evidence(order, meta)
         if not isinstance(order, dict) or not order.get("id"):

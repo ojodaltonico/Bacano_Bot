@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+from copy import deepcopy
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -70,23 +71,49 @@ def load_config():
 
 
 def save_config(config):
-    """Guardar configuración en archivo JSON"""
+    """Guardar cambios sin borrar secciones de configuracion no editadas."""
     try:
-        # Asegurarse de no guardar charset incompatible
-        if 'database' in config:
-            config['database'].pop('charset', None)
-            config['database'].pop('collation', None)
+        updates = deepcopy(config) if isinstance(config, dict) else {}
+        if 'database' in updates:
+            updates['database'].pop('charset', None)
+            updates['database'].pop('collation', None)
 
-        # Guardar siempre en la raíz
-        with open("config.json", 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
+        existing_path = find_config_file()
+        existing = {}
+        if existing_path:
+            with open(existing_path, 'r', encoding='utf-8') as source:
+                loaded = json.load(source)
+                if isinstance(loaded, dict):
+                    existing = loaded
 
-        logger.info("✅ Configuración guardada en config.json")
+        merged = _deep_merge(existing, updates)
+        if 'database' in merged:
+            merged['database'].pop('charset', None)
+            merged['database'].pop('collation', None)
+
+        target = Path(existing_path or CONFIG_PATHS[0])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_suffix(target.suffix + '.tmp')
+        with temporary.open('w', encoding='utf-8') as output:
+            json.dump(merged, output, indent=2, ensure_ascii=False)
+        os.replace(temporary, target)
+
+        logger.info(f"Configuracion guardada en {target}")
         return True
 
     except Exception as e:
-        logger.error(f"❌ Error guardando configuración: {e}")
+        logger.error(f"Error guardando configuracion: {e}")
         return False
+
+
+def _deep_merge(current, updates):
+    result = deepcopy(current) if isinstance(current, dict) else {}
+    for key, value in updates.items():
+        if isinstance(value, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = deepcopy(value)
+    return result
 
 
 # Funciones auxiliares

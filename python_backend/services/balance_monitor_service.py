@@ -7,6 +7,7 @@ from typing import Any
 from integrations.woocommerce_client import WooCommerceAPIError, WooCommerceClient
 from services.balance_credit_service import BalanceCreditService
 from services.balance_order_service import BalanceOrderService
+from services.balance_settings_service import BalanceSettingsService
 
 
 class BalanceMonitorService:
@@ -15,10 +16,37 @@ class BalanceMonitorService:
         woocommerce_client: WooCommerceClient | None = None,
         credit_service: BalanceCreditService | None = None,
         order_service: BalanceOrderService | None = None,
+        settings_service: BalanceSettingsService | None = None,
     ) -> None:
         self._woocommerce_client = woocommerce_client or WooCommerceClient()
         self._credit_service = credit_service or BalanceCreditService()
         self._order_service = order_service or BalanceOrderService()
+        self._settings_service = settings_service
+
+    def scan_configured_orders(self, *, limit: int = 50) -> dict[str, Any]:
+        settings_service = self._settings_service or BalanceSettingsService()
+        settings = settings_service.get_settings()
+        if not settings["monitor_payments"]:
+            return {
+                "mode": "disabled",
+                "filters": {},
+                "summary": {
+                    "analyzed": 0,
+                    "would_credit": 0,
+                    "credited": 0,
+                    "ignored": 0,
+                    "waiting": 0,
+                    "errors": 0,
+                },
+                "results": [],
+                "reason": "El monitoreo de pagos esta deshabilitado.",
+            }
+        return self.scan_recent_orders(
+            live=bool(settings["auto_credit"]),
+            limit=limit,
+            after_order_id=settings.get("monitor_after_order_id"),
+            after_date=settings.get("monitor_after_date"),
+        )
 
     def scan_recent_orders(
         self,

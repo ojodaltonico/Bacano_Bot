@@ -15,6 +15,9 @@ import traceback
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from services.balance_admin_service import BalanceAdminService
+from services.balance_settings_service import BalanceSettingsService
+
 
 class BacanoBotGUI:
     def __init__(self, root):
@@ -39,6 +42,9 @@ class BacanoBotGUI:
         # Estado
         self.is_flask_running = False
         self.is_node_running = False
+        self.balance_settings_service = BalanceSettingsService()
+        self.balance_admin_service = None
+        self.balance_rows = {}
 
         self.setup_ui()
 
@@ -99,6 +105,11 @@ class BacanoBotGUI:
         self.tab_dashboard = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_dashboard, text='📊 Dashboard')
         self.setup_dashboard_tab()
+
+        # Pestaña de administración de cargas de saldo
+        self.tab_balance = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_balance, text='💳 Cargas')
+        self.setup_balance_tab()
 
         # Pestaña 2: Logs
         self.tab_logs = ttk.Frame(self.notebook)
@@ -241,6 +252,234 @@ class BacanoBotGUI:
             text="🧹 Limpiar Logs",
             command=self.clear_logs
         ).pack(side="left", padx=5)
+
+    def setup_balance_tab(self):
+        controls = ttk.LabelFrame(self.tab_balance, text="Controles operativos", padding=10)
+        controls.pack(fill="x", padx=10, pady=10)
+
+        self.accept_new_loads_var = tk.BooleanVar(value=False)
+        self.monitor_payments_var = tk.BooleanVar(value=False)
+        self.auto_credit_var = tk.BooleanVar(value=False)
+
+        ttk.Checkbutton(
+            controls,
+            text="Aceptar nuevas cargas",
+            variable=self.accept_new_loads_var,
+        ).grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(
+            controls,
+            text="Monitorear pagos iniciados",
+            variable=self.monitor_payments_var,
+            command=self.on_monitor_toggle,
+        ).grid(row=0, column=1, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(
+            controls,
+            text="Acreditar automáticamente",
+            variable=self.auto_credit_var,
+            command=self.on_auto_credit_toggle,
+        ).grid(row=0, column=2, sticky="w", padx=5, pady=3)
+
+        ttk.Label(controls, text="Order ID mínimo:").grid(row=1, column=0, sticky="e", padx=5)
+        self.balance_after_order_entry = ttk.Entry(controls, width=14)
+        self.balance_after_order_entry.grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(controls, text="Fecha mínima ISO:").grid(row=1, column=2, sticky="e", padx=5)
+        self.balance_after_date_entry = ttk.Entry(controls, width=25)
+        self.balance_after_date_entry.grid(row=1, column=3, sticky="w", padx=5)
+        ttk.Label(controls, text="Intervalo (seg):").grid(row=1, column=4, sticky="e", padx=5)
+        self.balance_interval_entry = ttk.Entry(controls, width=8)
+        self.balance_interval_entry.grid(row=1, column=5, sticky="w", padx=5)
+        ttk.Button(controls, text="Guardar controles", command=self.save_balance_settings).grid(
+            row=0, column=5, padx=10, pady=3
+        )
+
+        filters = ttk.Frame(self.tab_balance)
+        filters.pack(fill="x", padx=10, pady=(0, 5))
+        ttk.Label(filters, text="Estado:").pack(side="left")
+        self.balance_status_filter = ttk.Combobox(
+            filters,
+            state="readonly",
+            values=("Todos", "Pendiente", "Pagado", "Acreditado", "Cancelado", "Fallido", "Error"),
+            width=14,
+        )
+        self.balance_status_filter.set("Todos")
+        self.balance_status_filter.pack(side="left", padx=5)
+        ttk.Label(filters, text="Order ID:").pack(side="left", padx=(15, 0))
+        self.balance_order_search = ttk.Entry(filters, width=14)
+        self.balance_order_search.pack(side="left", padx=5)
+        ttk.Button(filters, text="Actualizar", command=self.refresh_balance_loads).pack(side="left", padx=5)
+        self.balance_refresh_status = ttk.Label(filters, text="")
+        self.balance_refresh_status.pack(side="left", padx=10)
+
+        content = ttk.Panedwindow(self.tab_balance, orient=tk.VERTICAL)
+        content.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        table_frame = ttk.Frame(content)
+        detail_frame = ttk.LabelFrame(content, text="Detalle de la carga", padding=8)
+        content.add(table_frame, weight=3)
+        content.add(detail_frame, weight=2)
+
+        columns = (
+            "order_id", "date", "client", "dni", "amount", "method",
+            "woo_status", "local_status", "accreditation", "error",
+        )
+        self.balance_tree = ttk.Treeview(table_frame, columns=columns, show="headings", height=12)
+        headings = {
+            "order_id": "Order ID", "date": "Fecha", "client": "Cliente", "dni": "DNI",
+            "amount": "Importe", "method": "Método", "woo_status": "WooCommerce",
+            "local_status": "Estado local", "accreditation": "Acreditación", "error": "Último error",
+        }
+        widths = {"order_id": 75, "date": 145, "client": 150, "dni": 80, "amount": 85,
+                  "method": 150, "woo_status": 95, "local_status": 95,
+                  "accreditation": 90, "error": 220}
+        for column in columns:
+            self.balance_tree.heading(column, text=headings[column])
+            self.balance_tree.column(column, width=widths[column], anchor="w")
+        vertical_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.balance_tree.yview)
+        horizontal_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=self.balance_tree.xview)
+        self.balance_tree.configure(
+            yscrollcommand=vertical_scrollbar.set,
+            xscrollcommand=horizontal_scrollbar.set,
+        )
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        self.balance_tree.grid(row=0, column=0, sticky="nsew")
+        vertical_scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=0, sticky="ew")
+        self.balance_tree.bind("<<TreeviewSelect>>", self.on_balance_selected)
+
+        self.balance_detail = scrolledtext.ScrolledText(detail_frame, height=9, wrap=tk.WORD)
+        self.balance_detail.pack(fill="both", expand=True)
+        self.balance_detail.insert("1.0", "Seleccioná una carga para ver el detalle.")
+        self.balance_detail.config(state="disabled")
+        self.load_balance_settings()
+
+    def load_balance_settings(self):
+        settings = self.balance_settings_service.get_settings()
+        self.accept_new_loads_var.set(settings["accept_new_loads"])
+        self.monitor_payments_var.set(settings["monitor_payments"])
+        self.auto_credit_var.set(settings["auto_credit"])
+        self.balance_after_order_entry.delete(0, tk.END)
+        self.balance_after_order_entry.insert(0, settings.get("monitor_after_order_id") or "")
+        self.balance_after_date_entry.delete(0, tk.END)
+        self.balance_after_date_entry.insert(0, settings.get("monitor_after_date") or "")
+        self.balance_interval_entry.delete(0, tk.END)
+        self.balance_interval_entry.insert(0, settings.get("monitor_interval") or 60)
+
+    def on_monitor_toggle(self):
+        if not self.monitor_payments_var.get():
+            self.auto_credit_var.set(False)
+
+    def on_auto_credit_toggle(self):
+        if self.auto_credit_var.get() and not self.monitor_payments_var.get():
+            self.auto_credit_var.set(False)
+            messagebox.showwarning("Control seguro", "Primero habilitá el monitoreo de pagos.")
+
+    def save_balance_settings(self):
+        try:
+            settings = self.balance_settings_service.update_settings(
+                accept_new_loads=self.accept_new_loads_var.get(),
+                monitor_payments=self.monitor_payments_var.get(),
+                auto_credit=self.auto_credit_var.get(),
+                monitor_after_order_id=self.balance_after_order_entry.get().strip() or None,
+                monitor_after_date=self.balance_after_date_entry.get().strip() or None,
+                monitor_interval=self.balance_interval_entry.get().strip() or 60,
+            )
+            self.load_balance_settings()
+            self.log("✅ Controles operativos de cargas guardados")
+            messagebox.showinfo("Cargas", "Controles guardados correctamente.")
+            return settings
+        except Exception as exc:
+            messagebox.showerror("Cargas", str(exc))
+            return None
+
+    def refresh_balance_loads(self):
+        raw_order_id = self.balance_order_search.get().strip()
+        if raw_order_id and not raw_order_id.isdigit():
+            messagebox.showerror("Cargas", "El Order ID debe ser numérico.")
+            return
+        order_id = int(raw_order_id) if raw_order_id else None
+        status = self.balance_status_filter.get()
+        settings = self.balance_settings_service.get_settings()
+        self.balance_refresh_status.config(text="Actualizando...")
+
+        def worker():
+            try:
+                if self.balance_admin_service is None:
+                    self.balance_admin_service = BalanceAdminService()
+                rows = self.balance_admin_service.list_recent_loads(
+                    limit=100,
+                    status=status,
+                    order_id=order_id,
+                    refresh_remote=bool(settings["monitor_payments"]),
+                )
+                self.root.after(0, lambda: self.populate_balance_rows(rows))
+            except Exception as exc:
+                message = str(exc)
+                self.root.after(0, lambda value=message: self.balance_refresh_failed(value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def populate_balance_rows(self, rows):
+        self.balance_tree.delete(*self.balance_tree.get_children())
+        self.balance_rows = {int(row["order_id"]): row for row in rows}
+        for row in rows:
+            self.balance_tree.insert("", "end", iid=str(row["order_id"]), values=(
+                row["order_id"], row.get("date") or "-", row.get("client_name") or "-",
+                row.get("dni_masked") or "-", row.get("amount") or "-",
+                row.get("payment_method") or "-", row.get("woocommerce_status") or "-",
+                row.get("display_status") or "-", row.get("accreditation") or "No",
+                row.get("last_error") or "",
+            ))
+        self.balance_refresh_status.config(text=f"{len(rows)} carga(s)")
+
+    def balance_refresh_failed(self, message):
+        self.balance_refresh_status.config(text="Error")
+        messagebox.showerror("Cargas", message)
+
+    def on_balance_selected(self, _event=None):
+        selected = self.balance_tree.selection()
+        if not selected or self.balance_admin_service is None:
+            return
+        order_id = int(selected[0])
+        self.set_balance_detail_text("Cargando detalle...")
+
+        def worker():
+            try:
+                detail = self.balance_admin_service.get_load_detail(order_id, refresh_remote=False) or {}
+                detail.update({
+                    key: value
+                    for key, value in self.balance_rows.get(order_id, {}).items()
+                    if value is not None
+                })
+                self.root.after(0, lambda value=detail: self.render_balance_detail(value))
+            except Exception as exc:
+                message = str(exc)
+                self.root.after(0, lambda value=message: self.balance_refresh_failed(value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def render_balance_detail(self, detail):
+        monitor = detail.get("monitor_info") or {}
+        text = (
+            f"Referencia: {detail.get('reference') or '-'}\n"
+            f"Fecha de pago: {detail.get('date_paid') or '-'}\n"
+            f"Saldo anterior: {detail.get('previous_balance') or '-'}\n"
+            f"Importe: {detail.get('credited_amount') or detail.get('amount') or '-'}\n"
+            f"Saldo posterior: {detail.get('new_balance') or '-'}\n"
+            f"Recarga asociada: {detail.get('recarga_id') or '-'}\n"
+            f"Historial asociado: {detail.get('historial_id') or '-'}\n"
+            f"Error administrativo: {detail.get('admin_error') or detail.get('last_error') or '-'}\n"
+            f"Monitor: estado={monitor.get('local_status') or detail.get('local_status') or '-'} | "
+            f"pagado={monitor.get('paid')} | acreditado={detail.get('credited')} | "
+            f"puede acreditar={monitor.get('can_credit')}\n"
+            f"Motivo: {monitor.get('reason') or detail.get('reason') or '-'}"
+        )
+        self.set_balance_detail_text(text)
+
+    def set_balance_detail_text(self, text):
+        self.balance_detail.config(state="normal")
+        self.balance_detail.delete("1.0", tk.END)
+        self.balance_detail.insert("1.0", text)
+        self.balance_detail.config(state="disabled")
 
     def setup_config_tab(self):
         # Frame principal
