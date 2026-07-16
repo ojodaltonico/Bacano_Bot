@@ -5,6 +5,7 @@ from typing import Any
 from config_manager import load_config
 from integrations.woocommerce_client import WooCommerceAPIError, WooCommerceClient
 from services.balance_load_service import BalanceLoadService
+from services.order_classification import analyze_tickera_evidence, meta_to_map
 from services.balance_order_service import BalanceOrderService
 
 
@@ -306,78 +307,11 @@ class BalancePaymentService:
 
     @staticmethod
     def _meta_to_map(meta_data: Any) -> dict[str, str]:
-        result: dict[str, str] = {}
-        if not isinstance(meta_data, list):
-            return result
-        for item in meta_data:
-            if not isinstance(item, dict):
-                continue
-            key = str(item.get("key") or "").strip()
-            if key:
-                result[key] = str(item.get("value") or "")
-        return result
+        return meta_to_map(meta_data)
 
     @staticmethod
     def _analyze_tickera_evidence(order: dict[str, Any], meta: dict[str, str]) -> dict[str, Any]:
-        evidence: list[str] = []
-        line_items_summary: list[dict[str, Any]] = []
-        for item in order.get("line_items") or []:
-            item_meta_keys: list[str] = []
-            for meta_item in item.get("meta_data") or []:
-                if isinstance(meta_item, dict):
-                    key = str(meta_item.get("key") or "").strip()
-                    if key:
-                        item_meta_keys.append(key)
-
-            line_items_summary.append(
-                {
-                    "id": item.get("id"),
-                    "name": str(item.get("name") or "").strip(),
-                    "product_id": item.get("product_id"),
-                    "variation_id": item.get("variation_id"),
-                    "meta_keys": item_meta_keys,
-                }
-            )
-
-            for meta_key in item_meta_keys:
-                lowered_key = meta_key.lower()
-                if lowered_key.startswith("tc_"):
-                    evidence.append(f"line_item_meta:{meta_key}")
-                elif lowered_key in {
-                    "ticket type",
-                    "event",
-                    "ticket instance",
-                    "ticket_instance",
-                    "download_ticket",
-                }:
-                    evidence.append(f"line_item_meta:{meta_key}")
-                elif "ticket_type" in lowered_key or "ticket_instance" in lowered_key:
-                    evidence.append(f"line_item_meta:{meta_key}")
-
-        fee_lines_summary = [
-            {
-                "id": item.get("id"),
-                "name": str(item.get("name") or "").strip(),
-                "total": item.get("total"),
-                "tax_status": item.get("tax_status"),
-            }
-            for item in (order.get("fee_lines") or [])
-            if isinstance(item, dict)
-        ]
-
-        order_meta_keys_matching = []
-        for key in meta.keys():
-            lowered_key = key.lower()
-            if lowered_key.startswith("tc_") or "tickera" in lowered_key or "ticket" in lowered_key:
-                order_meta_keys_matching.append(key)
-
-        return {
-            "contains_tickera": bool(evidence),
-            "evidence": evidence,
-            "line_items": line_items_summary,
-            "fee_lines": fee_lines_summary,
-            "order_meta_keys_matching": order_meta_keys_matching,
-        }
+        return analyze_tickera_evidence(order, meta)
 
     @staticmethod
     def _same_decimal_amount(order_total: str, metadata_amount: str) -> bool:

@@ -10,6 +10,7 @@ from bs4 import BeautifulSoup
 from config_manager import load_config
 from integrations.tickera_client import TickeraClient
 from integrations.woocommerce_client import WooCommerceAPIError, WooCommerceClient
+from services.order_classification import evaluate_ticket_order, meta_to_map
 
 
 REQUEST_TIMEOUT = 30
@@ -43,12 +44,10 @@ class TicketDeliveryService:
             raise
 
         billing = order.get("billing") or {}
+        meta = meta_to_map(order.get("meta_data"))
+        ticket_order = evaluate_ticket_order(order, meta)
         line_items = order.get("line_items") or []
-        expected_tickets = sum(
-            int(item.get("quantity") or 0)
-            for item in line_items
-            if isinstance(item, dict)
-        )
+        expected_tickets = int(ticket_order.get("expected_tickets") or 0)
         product_names = [
             str(item.get("name") or "")
             for item in line_items
@@ -65,6 +64,16 @@ class TicketDeliveryService:
         is_cash = payment_method == "cod"
         not_ready_reasons: list[str] = []
         reason = None
+
+        if ticket_order.get("is_balance_load"):
+            not_ready_reasons.append("excluded_balance_load")
+            reason = "El pedido corresponde a una carga de saldo Bacano."
+        elif expected_tickets <= 0:
+            not_ready_reasons.append("no_ticket_quantity")
+            reason = "El pedido no tiene entradas reales para entregar."
+        elif not ticket_order.get("has_tickera_evidence"):
+            not_ready_reasons.append("missing_tickera_evidence")
+            reason = "No existe evidencia suficiente de Tickera para este pedido."
 
         if is_cash:
             not_ready_reasons.append("payment_method_not_allowed")
@@ -94,6 +103,8 @@ class TicketDeliveryService:
                 reason = "El pedido no tiene telefono de facturacion."
 
         ready_to_send = (
+            bool(ticket_order.get("is_ticket_order"))
+            and
             is_mercado_pago
             and status in {"processing", "completed"}
             and date_paid is not None
@@ -122,6 +133,10 @@ class TicketDeliveryService:
             "product_names": product_names,
             "is_mercado_pago": is_mercado_pago,
             "is_cash": is_cash,
+            "operation_type": str(ticket_order.get("operation_type") or ""),
+            "is_balance_load": bool(ticket_order.get("is_balance_load")),
+            "has_tickera_evidence": bool(ticket_order.get("has_tickera_evidence")),
+            "tickera_diagnostics": ticket_order.get("tickera_diagnostics"),
         }
 
     def get_ticket_download_links(self, order_id: int) -> list[dict[str, Any]]:
@@ -154,6 +169,7 @@ class TicketDeliveryService:
                 date_paid=delivery_info.get("date_paid"),
                 needs_payment=delivery_info.get("needs_payment"),
                 billing_phone_present=bool(delivery_info.get("billing_phone")),
+                expected_tickets=int(delivery_info.get("expected_tickets") or 0),
             )
 
         expected_tickets = int(delivery_info["expected_tickets"])
@@ -165,15 +181,29 @@ class TicketDeliveryService:
             return self._build_not_ready_response(
                 order_id=order_id,
                 reason=str(exc),
-                not_ready_reasons=delivery_info.get("not_ready_reasons") or [],
+                not_ready_reasons=["ticket_access_error"],
                 status=delivery_info.get("status"),
                 payment_method=delivery_info.get("payment_method"),
                 date_paid=delivery_info.get("date_paid"),
                 needs_payment=delivery_info.get("needs_payment"),
                 billing_phone_present=bool(delivery_info.get("billing_phone")),
+                expected_tickets=expected_tickets,
             )
 
         found_tickets = len(downloaded_tickets)
+        if found_tickets <= 0:
+            return self._build_not_ready_response(
+                order_id=order_id,
+                reason="Tickera todavia no genero tickets descargables para el pedido.",
+                not_ready_reasons=["ticket_not_generated"],
+                status=delivery_info.get("status"),
+                payment_method=delivery_info.get("payment_method"),
+                date_paid=delivery_info.get("date_paid"),
+                needs_payment=delivery_info.get("needs_payment"),
+                billing_phone_present=bool(delivery_info.get("billing_phone")),
+                expected_tickets=expected_tickets,
+                found_tickets=0,
+            )
         if found_tickets < expected_tickets:
             return self._build_not_ready_response(
                 order_id=order_id,
@@ -181,12 +211,14 @@ class TicketDeliveryService:
                     "Se encontraron menos tickets de los esperados "
                     f"({found_tickets}/{expected_tickets})."
                 ),
-                not_ready_reasons=delivery_info.get("not_ready_reasons") or [],
+                not_ready_reasons=["ticket_not_generated"],
                 status=delivery_info.get("status"),
                 payment_method=delivery_info.get("payment_method"),
                 date_paid=delivery_info.get("date_paid"),
                 needs_payment=delivery_info.get("needs_payment"),
                 billing_phone_present=bool(delivery_info.get("billing_phone")),
+                expected_tickets=expected_tickets,
+                found_tickets=found_tickets,
             )
 
         customer_name = " ".join(
@@ -272,6 +304,8 @@ class TicketDeliveryService:
         date_paid: Any = None,
         needs_payment: bool | None = None,
         billing_phone_present: bool | None = None,
+        expected_tickets: int = 0,
+        found_tickets: int = 0,
     ) -> dict[str, Any]:
         return {
             "ready": False,
@@ -287,7 +321,8 @@ class TicketDeliveryService:
             "billing_phone": None,
             "billing_phone_present": billing_phone_present,
             "phone_present": bool(billing_phone_present),
-            "expected_tickets": 0,
+            "expected_tickets": expected_tickets,
+            "found_tickets": found_tickets,
             "products": [],
         }
 
@@ -320,8 +355,6 @@ class TicketDeliveryService:
                 ticket_download["buyer_first"],
                 ticket_download["buyer_last"],
             )
-            if output_path.exists():
-                raise RuntimeError(f"El archivo destino ya existe: {output_path}")
 
             response = self._download_pdf_response(session, ticket_download["download_url"])
             if not self._is_valid_pdf(

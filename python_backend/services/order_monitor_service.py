@@ -8,6 +8,7 @@ import requests
 
 from integrations.woocommerce_client import WooCommerceClient
 from services.delivery_state_service import DeliveryStateService
+from services.order_classification import evaluate_ticket_order, meta_to_map
 from services.ticket_delivery_service import TicketDeliveryService
 from utils.phone_utils import mask_phone, normalize_argentine_phone
 
@@ -15,65 +16,48 @@ from utils.phone_utils import mask_phone, normalize_argentine_phone
 DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
 ENDPOINT_URL = "http://127.0.0.1:3000/internal/send-document"
 REQUEST_TIMEOUT = 30
+MERCADO_PAGO_METHOD = "woo-mercado-pago-custom"
 
 
 class OrderMonitorService:
-    def __init__(self) -> None:
-        self._woocommerce_client = WooCommerceClient()
-        self._ticket_delivery_service = TicketDeliveryService()
-        self._delivery_state_service = DeliveryStateService()
+    def __init__(
+        self,
+        woocommerce_client: WooCommerceClient | None = None,
+        ticket_delivery_service: TicketDeliveryService | None = None,
+        delivery_state_service: DeliveryStateService | None = None,
+    ) -> None:
+        self._woocommerce_client = woocommerce_client or WooCommerceClient()
+        self._ticket_delivery_service = ticket_delivery_service or TicketDeliveryService()
+        self._delivery_state_service = delivery_state_service or DeliveryStateService()
 
     def scan_recent_orders(self, limit: int = 20, dry_run: bool = True) -> dict[str, Any]:
-        orders = self._woocommerce_client.get_orders(per_page=limit, page=1)
-        if not isinstance(orders, list):
-            raise RuntimeError("WooCommerce no devolvio una lista de pedidos recientes.")
+        if limit <= 0:
+            raise ValueError("limit debe ser mayor que 0.")
 
+        orders = self._fetch_order_pages(page_size=min(limit, 100), limit=limit, after_order_id=None)
         results: list[dict[str, Any]] = []
-        counts = {
-            "analyzed": 0,
-            "simulated": 0,
-            "waiting": 0,
-            "ignored": 0,
-            "errors": 0,
-            "already_sent": 0,
-        }
 
-        for order in orders[:limit]:
-            counts["analyzed"] += 1
+        for order in orders:
             try:
                 result = self._scan_single_order(order, dry_run=dry_run)
             except Exception as exc:
-                order_id = order.get("id") if isinstance(order, dict) else None
-                order_id = int(order_id) if isinstance(order_id, int) else 0
-                self._delivery_state_service.mark_error(
+                order_id = self._safe_order_id(order)
+                self._delivery_state_service.mark_retryable_error(
                     order_id,
                     last_error=str(exc),
                     metadata_json={"summary": "error_durante_analisis"},
                 )
-                result = {
-                    "order_id": order_id,
-                    "status": "error",
-                    "summary": "error durante analisis",
-                    "expected_tickets": 0,
-                    "found_tickets": 0,
-                    "phone_valid": False,
-                }
-
+                result = self._build_result(
+                    order_id,
+                    "retryable_error",
+                    "error durante analisis",
+                    changed=True,
+                )
             results.append(result)
-            if result["status"] == "simulated":
-                counts["simulated"] += 1
-            elif result["status"] == "waiting":
-                counts["waiting"] += 1
-            elif result["status"] == "ignored":
-                counts["ignored"] += 1
-            elif result["status"] == "error":
-                counts["errors"] += 1
-            elif result["status"] == "already_sent":
-                counts["already_sent"] += 1
 
         return {
             "results": results,
-            "summary": counts,
+            "summary": self._build_summary(results),
         }
 
     def live_test_recent_orders(
@@ -83,124 +67,74 @@ class OrderMonitorService:
         if not normalized_test_phone:
             raise RuntimeError("El telefono de prueba no es valido.")
 
-        orders = self._woocommerce_client.get_orders(per_page=limit, page=1)
-        if not isinstance(orders, list):
-            raise RuntimeError("WooCommerce no devolvio una lista de pedidos recientes.")
-
+        orders = self._fetch_order_pages(
+            page_size=min(limit, 100),
+            limit=limit,
+            after_order_id=after_order_id,
+        )
         results: list[dict[str, Any]] = []
-        counts = {
-            "analyzed": 0,
-            "sent": 0,
-            "ignored": 0,
-            "waiting": 0,
-            "errors": 0,
-            "already_sent": 0,
-            "skipped_before_cutoff": 0,
-        }
 
-        for order in orders[:limit]:
-            order_id = int(order.get("id") or 0) if isinstance(order, dict) else 0
+        for order in orders:
+            order_id = self._safe_order_id(order)
             if order_id <= after_order_id:
-                counts["skipped_before_cutoff"] += 1
                 continue
-
-            counts["analyzed"] += 1
             try:
                 result = self._live_test_single_order(order, normalized_test_phone)
             except Exception as exc:
                 safe_error = str(exc) or "error durante analisis"
-                self._delivery_state_service.mark_error(
+                self._delivery_state_service.mark_retryable_error(
                     order_id,
                     last_error=safe_error,
                     metadata_json={"summary": "error_durante_live_test"},
                 )
-                result = {
-                    "order_id": order_id,
-                    "status": "error",
-                    "summary": safe_error,
-                    "expected_tickets": 0,
-                    "found_tickets": 0,
-                    "changed": True,
-                }
-
+                result = self._build_result(
+                    order_id,
+                    "retryable_error",
+                    safe_error,
+                    changed=True,
+                )
             results.append(result)
-            status = result.get("status")
-            if status == "sent":
-                counts["sent"] += 1
-            elif status == "ignored":
-                counts["ignored"] += 1
-            elif status == "waiting":
-                counts["waiting"] += 1
-            elif status == "already_sent":
-                counts["already_sent"] += 1
-            elif status == "error":
-                counts["errors"] += 1
 
         return {
             "results": results,
-            "summary": counts,
+            "summary": self._build_summary(results),
         }
 
     def live_recent_orders(self, limit: int, after_order_id: int) -> dict[str, Any]:
-        orders = self._woocommerce_client.get_orders(per_page=limit, page=1)
-        if not isinstance(orders, list):
-            raise RuntimeError("WooCommerce no devolvio una lista de pedidos recientes.")
-
+        orders = self._fetch_order_pages(
+            page_size=min(limit, 100),
+            limit=limit,
+            after_order_id=after_order_id,
+        )
         results: list[dict[str, Any]] = []
-        counts = {
-            "analyzed": 0,
-            "sent": 0,
-            "ignored": 0,
-            "waiting": 0,
-            "errors": 0,
-            "already_sent": 0,
-            "skipped_before_cutoff": 0,
-        }
 
-        for order in orders[:limit]:
-            order_id = int(order.get("id") or 0) if isinstance(order, dict) else 0
+        for order in orders:
+            order_id = self._safe_order_id(order)
             if order_id <= after_order_id:
-                counts["skipped_before_cutoff"] += 1
                 continue
-
-            counts["analyzed"] += 1
             try:
                 result = self._live_single_order(order)
             except Exception as exc:
                 safe_error = str(exc) or "error durante analisis"
-                self._delivery_state_service.mark_error(
+                self._delivery_state_service.mark_retryable_error(
                     order_id,
                     last_error=safe_error,
                     metadata_json={"summary": "error_durante_live"},
                 )
-                result = {
-                    "order_id": order_id,
-                    "status": "error",
-                    "summary": safe_error,
-                    "expected_tickets": 0,
-                    "found_tickets": 0,
-                    "changed": True,
-                    "payment_method": str(order.get("payment_method") or ""),
-                    "masked_destination": "",
-                    "sent_tickets": 0,
-                }
-
+                result = self._build_result(
+                    order_id,
+                    "retryable_error",
+                    safe_error,
+                    changed=True,
+                    payment_method=str(order.get("payment_method") or ""),
+                    masked_destination="",
+                    sent_tickets=0,
+                )
             results.append(result)
-            status = result.get("status")
-            if status == "sent":
-                counts["sent"] += 1
-            elif status == "ignored":
-                counts["ignored"] += 1
-            elif status == "waiting":
-                counts["waiting"] += 1
-            elif status == "already_sent":
-                counts["already_sent"] += 1
-            elif status == "error":
-                counts["errors"] += 1
 
         return {
             "results": results,
-            "summary": counts,
+            "summary": self._build_summary(results),
         }
 
     def send_order_for_test(
@@ -257,19 +191,32 @@ class OrderMonitorService:
                 "masked_real_destination": masked_billing_phone,
                 "expected_tickets": prepare_result.get("expected_tickets", 0),
                 "found_tickets": prepare_result.get("found_tickets", 0),
+                "not_ready_reasons": prepare_result.get("not_ready_reasons") or [],
             }
 
         ticket_pdfs = prepare_result.get("ticket_pdfs") or []
         if not ticket_pdfs:
-            ticket_pdfs = [
-                {
-                    "transaction_id": "",
-                    "ticket_type": "",
-                    "event_name": "",
-                    "pdf_path": pdf_path,
-                }
-                for pdf_path in (prepare_result.get("pdf_files") or [])
-            ]
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "already_sent": False,
+                "reason": "No hay tickets PDF para enviar.",
+                "expected_tickets": prepare_result.get("expected_tickets", 0),
+                "found_tickets": prepare_result.get("found_tickets", 0),
+                "billing_phone_present": billing_phone_present,
+                "billing_phone_normalizable": billing_phone_normalizable,
+                "masked_real_destination": masked_billing_phone,
+            }
+
+        self._delivery_state_service.mark_sending(
+            order_id,
+            payment_method=delivery_info.get("payment_method"),
+            order_status=delivery_info.get("status"),
+            expected_tickets=int(prepare_result.get("expected_tickets") or 0),
+            found_tickets=int(prepare_result.get("found_tickets") or 0),
+            phone_normalized=normalized_test_phone,
+            metadata_json={"summary": "sending_test"},
+        )
 
         send_results: list[dict[str, Any]] = []
         total = len(ticket_pdfs)
@@ -291,7 +238,7 @@ class OrderMonitorService:
                 }
             )
             if not ok:
-                self._delivery_state_service.mark_error(
+                self._delivery_state_service.mark_retryable_error(
                     order_id,
                     payment_method=delivery_info.get("payment_method"),
                     order_status=delivery_info.get("status"),
@@ -312,12 +259,11 @@ class OrderMonitorService:
                     "sent_tickets": sum(1 for item in send_results if item["ok"]),
                     "results": send_results,
                     "reason": detail,
-                    "state_saved": "error",
+                    "state_saved": "retryable_error",
                     "billing_phone_present": billing_phone_present,
                     "billing_phone_normalizable": billing_phone_normalizable,
                     "masked_real_destination": masked_billing_phone,
                 }
-
             if index < total:
                 time.sleep(1)
 
@@ -370,7 +316,7 @@ class OrderMonitorService:
             }
 
         if not billing_phone_normalizable:
-            self._delivery_state_service.mark_error(
+            self._delivery_state_service.mark_permanent_error(
                 order_id,
                 payment_method=delivery_info.get("payment_method"),
                 order_status=delivery_info.get("status"),
@@ -394,7 +340,7 @@ class OrderMonitorService:
                 "billing_phone_present": billing_phone_present,
                 "billing_phone_normalizable": False,
                 "masked_destination": masked_billing_phone,
-                "state_saved": "error",
+                "state_saved": "permanent_error",
             }
 
         destination_dir = DEBUG_DIR / f"delivery_live_{order_id}"
@@ -415,19 +361,35 @@ class OrderMonitorService:
                 "billing_phone_present": billing_phone_present,
                 "billing_phone_normalizable": True,
                 "masked_destination": masked_billing_phone,
+                "not_ready_reasons": prepare_result.get("not_ready_reasons") or [],
             }
 
         ticket_pdfs = prepare_result.get("ticket_pdfs") or []
         if not ticket_pdfs:
-            ticket_pdfs = [
-                {
-                    "transaction_id": "",
-                    "ticket_type": "",
-                    "event_name": "",
-                    "pdf_path": pdf_path,
-                }
-                for pdf_path in (prepare_result.get("pdf_files") or [])
-            ]
+            return {
+                "ok": False,
+                "order_id": order_id,
+                "already_sent": False,
+                "reason": "No hay tickets PDF para enviar.",
+                "status": delivery_info.get("status"),
+                "payment_method": delivery_info.get("payment_method"),
+                "expected_tickets": prepare_result.get("expected_tickets", 0),
+                "found_tickets": prepare_result.get("found_tickets", 0),
+                "sent_tickets": 0,
+                "billing_phone_present": billing_phone_present,
+                "billing_phone_normalizable": True,
+                "masked_destination": masked_billing_phone,
+            }
+
+        self._delivery_state_service.mark_sending(
+            order_id,
+            payment_method=delivery_info.get("payment_method"),
+            order_status=delivery_info.get("status"),
+            expected_tickets=int(prepare_result.get("expected_tickets") or 0),
+            found_tickets=int(prepare_result.get("found_tickets") or 0),
+            phone_normalized=normalized_billing_phone,
+            metadata_json={"summary": "sending_live"},
+        )
 
         send_results: list[dict[str, Any]] = []
         total = len(ticket_pdfs)
@@ -451,7 +413,7 @@ class OrderMonitorService:
                 }
             )
             if not ok:
-                self._delivery_state_service.mark_error(
+                self._delivery_state_service.mark_retryable_error(
                     order_id,
                     payment_method=delivery_info.get("payment_method"),
                     order_status=delivery_info.get("status"),
@@ -475,9 +437,8 @@ class OrderMonitorService:
                     "billing_phone_present": billing_phone_present,
                     "billing_phone_normalizable": True,
                     "masked_destination": masked_billing_phone,
-                    "state_saved": "error",
+                    "state_saved": "retryable_error",
                 }
-
             if index < total:
                 time.sleep(1)
 
@@ -509,104 +470,173 @@ class OrderMonitorService:
             "state_saved": "sent",
         }
 
+    def _fetch_order_pages(
+        self,
+        *,
+        page_size: int,
+        limit: int,
+        after_order_id: int | None,
+    ) -> list[dict[str, Any]]:
+        seen_ids: set[int] = set()
+        orders: list[dict[str, Any]] = []
+        page = 1
+
+        while True:
+            page_orders = self._woocommerce_client.get_orders(per_page=page_size, page=page)
+            if not isinstance(page_orders, list):
+                raise RuntimeError("WooCommerce no devolvio una lista de pedidos recientes.")
+            if not page_orders:
+                break
+
+            valid_page_ids: list[int] = []
+            for item in page_orders:
+                if not isinstance(item, dict):
+                    continue
+                order_id = self._safe_order_id(item)
+                if not order_id:
+                    continue
+                valid_page_ids.append(order_id)
+                if order_id in seen_ids:
+                    continue
+                seen_ids.add(order_id)
+                orders.append(item)
+
+            if len(page_orders) < page_size:
+                break
+            if after_order_id is None and len(orders) >= limit:
+                break
+            if after_order_id is not None and valid_page_ids and all(order_id <= after_order_id for order_id in valid_page_ids):
+                break
+            page += 1
+
+        orders.sort(key=lambda order: self._safe_order_id(order))
+        if after_order_id is None:
+            return orders[-limit:]
+        return orders
+
     def _scan_single_order(self, order: dict[str, Any], dry_run: bool) -> dict[str, Any]:
-        order_id = int(order.get("id") or 0)
+        order_id = self._safe_order_id(order)
         payment_method = str(order.get("payment_method") or "")
         order_status = str(order.get("status") or "")
+        meta = meta_to_map(order.get("meta_data"))
+        ticket_order = evaluate_ticket_order(order, meta)
         previous_state = self._delivery_state_service.get_order_state(order_id)
+
+        if self._delivery_state_service.has_been_sent(order_id):
+            return self._build_result(
+                order_id,
+                "already_sent",
+                "ya enviado",
+                changed=False,
+            )
 
         self._delivery_state_service.mark_detected(
             order_id,
             payment_method=payment_method,
             order_status=order_status,
+            expected_tickets=int(ticket_order.get("expected_tickets") or 0),
+            metadata_json={"summary": "detected"},
         )
 
-        if self._delivery_state_service.has_been_sent(order_id):
-            return {
-                "order_id": order_id,
-                "status": "already_sent",
-                "summary": "ya enviado",
-                "expected_tickets": 0,
-                "found_tickets": 0,
-                "phone_valid": False,
-                "changed": False,
-            }
+        exclusion_reasons = set(ticket_order.get("exclusion_reasons") or [])
+        if "balance_load_operation" in exclusion_reasons:
+            return self._mark_ignored(
+                order_id,
+                previous_state,
+                payment_method,
+                order_status,
+                "pedido de carga de saldo",
+            )
+        if "no_ticket_quantity" in exclusion_reasons:
+            return self._mark_ignored(
+                order_id,
+                previous_state,
+                payment_method,
+                order_status,
+                "sin entradas reales",
+            )
+        if "missing_tickera_evidence" in exclusion_reasons:
+            return self._mark_ignored(
+                order_id,
+                previous_state,
+                payment_method,
+                order_status,
+                "sin evidencia suficiente de Tickera",
+            )
 
         if payment_method == "cod":
-            self._delivery_state_service.mark_ignored(
+            return self._mark_ignored(
                 order_id,
-                payment_method=payment_method,
-                order_status=order_status,
-                metadata_json={"summary": "efectivo/RRPP"},
-            )
-            return self._build_result(
-                order_id,
-                "ignored",
+                previous_state,
+                payment_method,
+                order_status,
                 "efectivo/RRPP",
-                changed=self._did_result_change(previous_state, "ignored", 0, 0, False),
             )
 
-        if payment_method != "woo-mercado-pago-custom":
-            self._delivery_state_service.mark_ignored(
+        if payment_method != MERCADO_PAGO_METHOD:
+            return self._mark_ignored(
                 order_id,
-                payment_method=payment_method,
-                order_status=order_status,
-                metadata_json={"summary": "metodo no habilitado"},
-            )
-            return self._build_result(
-                order_id,
-                "ignored",
+                previous_state,
+                payment_method,
+                order_status,
                 "metodo no habilitado",
-                changed=self._did_result_change(previous_state, "ignored", 0, 0, False),
             )
 
         if order_status in {"cancelled", "refunded", "failed"}:
-            self._delivery_state_service.mark_ignored(
+            return self._mark_ignored(
                 order_id,
-                payment_method=payment_method,
-                order_status=order_status,
-                metadata_json={"summary": f"estado {order_status}"},
-            )
-            return self._build_result(
-                order_id,
-                "ignored",
+                previous_state,
+                payment_method,
+                order_status,
                 f"estado {order_status}",
-                changed=self._did_result_change(previous_state, "ignored", 0, 0, False),
             )
 
         delivery_info = self._ticket_delivery_service.get_order_delivery_info(order_id)
         normalized_phone = self._normalize_argentine_phone(delivery_info.get("billing_phone"))
         phone_valid = bool(normalized_phone)
         expected_tickets = int(delivery_info.get("expected_tickets") or 0)
-
         waiting_reasons = set(delivery_info.get("not_ready_reasons") or [])
-        if {
-            "payment_not_confirmed",
-            "still_needs_payment",
-            "status_not_ready",
-            "missing_phone",
-        } & waiting_reasons:
-            summary = self._build_waiting_summary(waiting_reasons, order_status)
-            self._delivery_state_service.mark_waiting(
+
+        if {"payment_not_confirmed", "still_needs_payment", "status_not_ready"} & waiting_reasons:
+            summary = self._build_waiting_payment_summary(waiting_reasons, order_status)
+            self._delivery_state_service.mark_waiting_payment(
                 order_id,
                 payment_method=payment_method,
                 order_status=order_status,
-                expected_tickets=int(delivery_info.get("expected_tickets") or 0),
+                expected_tickets=expected_tickets,
                 phone_normalized=normalized_phone,
                 metadata_json={"summary": summary, "phone_valid": phone_valid},
             )
             return self._build_result(
                 order_id,
-                "waiting",
+                "waiting_payment",
                 summary,
                 expected_tickets=expected_tickets,
                 phone_valid=phone_valid,
                 changed=self._did_result_change(
-                    previous_state,
-                    "waiting",
-                    expected_tickets,
-                    0,
-                    phone_valid,
+                    previous_state, "waiting_payment", expected_tickets, 0, phone_valid
+                ),
+            )
+
+        if "missing_phone" in waiting_reasons:
+            summary = "telefono no normalizable"
+            self._delivery_state_service.mark_permanent_error(
+                order_id,
+                payment_method=payment_method,
+                order_status=order_status,
+                expected_tickets=expected_tickets,
+                phone_normalized=normalized_phone,
+                last_error=summary,
+                metadata_json={"summary": summary, "phone_valid": phone_valid},
+            )
+            return self._build_result(
+                order_id,
+                "permanent_error",
+                summary,
+                expected_tickets=expected_tickets,
+                phone_valid=phone_valid,
+                changed=self._did_result_change(
+                    previous_state, "permanent_error", expected_tickets, 0, phone_valid
                 ),
             )
 
@@ -635,35 +665,16 @@ class OrderMonitorService:
         found_tickets = int(prepare_result.get("found_tickets") or 0)
 
         if not prepare_result.get("ready"):
-            summary = "tickets no generados todavia"
-            if found_tickets and found_tickets < expected_tickets:
-                summary = f"tickets {found_tickets}/{expected_tickets}"
-            elif prepare_result.get("reason"):
-                summary = str(prepare_result["reason"])
-
-            self._delivery_state_service.mark_waiting(
-                order_id,
+            return self._handle_not_ready_prepare_result(
+                order_id=order_id,
+                previous_state=previous_state,
                 payment_method=payment_method,
                 order_status=order_status,
                 expected_tickets=expected_tickets,
                 found_tickets=found_tickets,
-                phone_normalized=normalized_phone,
-                metadata_json={"summary": summary, "phone_valid": phone_valid},
-            )
-            return self._build_result(
-                order_id,
-                "waiting",
-                summary,
-                expected_tickets=expected_tickets,
-                found_tickets=found_tickets,
                 phone_valid=phone_valid,
-                changed=self._did_result_change(
-                    previous_state,
-                    "waiting",
-                    expected_tickets,
-                    found_tickets,
-                    phone_valid,
-                ),
+                normalized_phone=normalized_phone,
+                prepare_result=prepare_result,
             )
 
         if dry_run:
@@ -684,11 +695,7 @@ class OrderMonitorService:
                 found_tickets=found_tickets,
                 phone_valid=phone_valid,
                 changed=self._did_result_change(
-                    previous_state,
-                    "simulated",
-                    expected_tickets,
-                    found_tickets,
-                    phone_valid,
+                    previous_state, "simulated", expected_tickets, found_tickets, phone_valid
                 ),
             )
 
@@ -709,77 +716,139 @@ class OrderMonitorService:
             found_tickets=found_tickets,
             phone_valid=phone_valid,
             changed=self._did_result_change(
-                previous_state,
-                "ready",
-                expected_tickets,
-                found_tickets,
-                phone_valid,
+                previous_state, "ready", expected_tickets, found_tickets, phone_valid
             ),
+        )
+
+    def _handle_not_ready_prepare_result(
+        self,
+        *,
+        order_id: int,
+        previous_state: dict[str, Any] | None,
+        payment_method: str,
+        order_status: str,
+        expected_tickets: int,
+        found_tickets: int,
+        phone_valid: bool,
+        normalized_phone: str | None,
+        prepare_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        reasons = set(prepare_result.get("not_ready_reasons") or [])
+        summary = str(prepare_result.get("reason") or "tickets no listos")
+
+        if "ticket_not_generated" in reasons:
+            self._delivery_state_service.mark_waiting_ticket(
+                order_id,
+                payment_method=payment_method,
+                order_status=order_status,
+                expected_tickets=expected_tickets,
+                found_tickets=found_tickets,
+                phone_normalized=normalized_phone,
+                metadata_json={"summary": summary, "phone_valid": phone_valid},
+            )
+            return self._build_result(
+                order_id,
+                "waiting_ticket",
+                summary,
+                expected_tickets=expected_tickets,
+                found_tickets=found_tickets,
+                phone_valid=phone_valid,
+                changed=self._did_result_change(
+                    previous_state, "waiting_ticket", expected_tickets, found_tickets, phone_valid
+                ),
+            )
+
+        self._delivery_state_service.mark_retryable_error(
+            order_id,
+            payment_method=payment_method,
+            order_status=order_status,
+            expected_tickets=expected_tickets,
+            found_tickets=found_tickets,
+            phone_normalized=normalized_phone,
+            last_error=summary,
+            metadata_json={"summary": summary, "phone_valid": phone_valid},
+        )
+        return self._build_result(
+            order_id,
+            "retryable_error",
+            summary,
+            expected_tickets=expected_tickets,
+            found_tickets=found_tickets,
+            phone_valid=phone_valid,
+            changed=self._did_result_change(
+                previous_state, "retryable_error", expected_tickets, found_tickets, phone_valid
+            ),
+        )
+
+    def _mark_ignored(
+        self,
+        order_id: int,
+        previous_state: dict[str, Any] | None,
+        payment_method: str,
+        order_status: str,
+        summary: str,
+    ) -> dict[str, Any]:
+        self._delivery_state_service.mark_ignored(
+            order_id,
+            payment_method=payment_method,
+            order_status=order_status,
+            metadata_json={"summary": summary},
+        )
+        return self._build_result(
+            order_id,
+            "ignored",
+            summary,
+            changed=self._did_result_change(previous_state, "ignored", 0, 0, False),
         )
 
     def _live_test_single_order(
         self, order: dict[str, Any], normalized_test_phone: str
     ) -> dict[str, Any]:
         dry_run_result = self._scan_single_order(order, dry_run=True)
-        order_id = int(order.get("id") or 0)
+        order_id = self._safe_order_id(order)
 
-        if dry_run_result["status"] == "already_sent":
-            return {
-                **dry_run_result,
-                "changed": False,
-            }
-
-        if dry_run_result["status"] == "ignored":
-            return dry_run_result
-
-        if dry_run_result["status"] == "waiting":
-            return dry_run_result
-
-        if dry_run_result["status"] == "error":
+        if dry_run_result["status"] in {"already_sent", "ignored", "waiting_payment", "waiting_ticket"}:
+            return {**dry_run_result, "changed": dry_run_result.get("changed", False)}
+        if dry_run_result["status"] in {"retryable_error", "permanent_error"}:
             return dry_run_result
 
         send_result = self.send_order_for_test(order_id, normalized_test_phone, force=False)
         if send_result.get("already_sent"):
-            return {
-                "order_id": order_id,
-                "status": "already_sent",
-                "summary": "ya enviado",
-                "expected_tickets": int(send_result.get("expected_tickets") or 0),
-                "found_tickets": int(send_result.get("found_tickets") or 0),
-                "phone_valid": True,
-                "changed": False,
-            }
+            return self._build_result(order_id, "already_sent", "ya enviado", changed=False)
 
         if send_result.get("ok"):
-            return {
-                "order_id": order_id,
-                "status": "sent",
-                "summary": "enviado a telefono de prueba",
-                "expected_tickets": int(send_result.get("expected_tickets") or 0),
-                "found_tickets": int(send_result.get("found_tickets") or 0),
-                "phone_valid": True,
-                "changed": True,
-                "billing_phone_present": bool(send_result.get("billing_phone_present")),
-                "billing_phone_normalizable": bool(send_result.get("billing_phone_normalizable")),
-                "masked_real_destination": str(send_result.get("masked_real_destination") or ""),
-            }
+            return self._build_result(
+                order_id,
+                "sent",
+                "enviado a telefono de prueba",
+                expected_tickets=int(send_result.get("expected_tickets") or 0),
+                found_tickets=int(send_result.get("found_tickets") or 0),
+                phone_valid=True,
+                changed=True,
+                billing_phone_present=bool(send_result.get("billing_phone_present")),
+                billing_phone_normalizable=bool(send_result.get("billing_phone_normalizable")),
+                masked_real_destination=str(send_result.get("masked_real_destination") or ""),
+            )
 
-        return {
-            "order_id": order_id,
-            "status": "error",
-            "summary": str(send_result.get("reason") or "Error en envio de prueba."),
-            "expected_tickets": int(send_result.get("expected_tickets") or 0),
-            "found_tickets": int(send_result.get("found_tickets") or 0),
-            "phone_valid": True,
-            "changed": True,
-            "billing_phone_present": bool(send_result.get("billing_phone_present")),
-            "billing_phone_normalizable": bool(send_result.get("billing_phone_normalizable")),
-            "masked_real_destination": str(send_result.get("masked_real_destination") or ""),
-        }
+        state_status = "retryable_error"
+        if send_result.get("reason") == "invalid_phone":
+            state_status = "permanent_error"
+        return self._build_result(
+            order_id,
+            state_status,
+            str(send_result.get("reason") or "Error en envio de prueba."),
+            expected_tickets=int(send_result.get("expected_tickets") or 0),
+            found_tickets=int(send_result.get("found_tickets") or 0),
+            phone_valid=True,
+            changed=True,
+            billing_phone_present=bool(send_result.get("billing_phone_present")),
+            billing_phone_normalizable=bool(send_result.get("billing_phone_normalizable")),
+            masked_real_destination=str(send_result.get("masked_real_destination") or ""),
+        )
 
     def _live_single_order(self, order: dict[str, Any]) -> dict[str, Any]:
         dry_run_result = self._scan_single_order(order, dry_run=True)
-        order_id = int(order.get("id") or 0)
+        order_id = self._safe_order_id(order)
         payment_method = str(order.get("payment_method") or "")
         delivery_info = self._ticket_delivery_service.get_order_delivery_info(order_id)
         normalized_billing_phone = self._normalize_argentine_phone(delivery_info.get("billing_phone"))
@@ -794,38 +863,13 @@ class OrderMonitorService:
                 "changed": False,
             }
 
-        ready_candidate = (
-            payment_method == "woo-mercado-pago-custom"
-            and str(delivery_info.get("status") or "") in {"processing", "completed"}
-            and bool(delivery_info.get("date_paid"))
-            and not bool(delivery_info.get("needs_payment"))
-        )
-        if ready_candidate and not normalized_billing_phone:
-            self._delivery_state_service.mark_error(
-                order_id,
-                payment_method=payment_method,
-                order_status=delivery_info.get("status"),
-                expected_tickets=int(delivery_info.get("expected_tickets") or 0),
-                found_tickets=0,
-                sent_tickets=0,
-                phone_normalized=None,
-                last_error="invalid_phone",
-                metadata_json={"summary": "invalid_phone"},
-            )
-            return {
-                "order_id": order_id,
-                "status": "error",
-                "summary": "invalid_phone",
-                "expected_tickets": int(delivery_info.get("expected_tickets") or 0),
-                "found_tickets": 0,
-                "phone_valid": False,
-                "changed": True,
-                "payment_method": payment_method,
-                "masked_destination": masked_destination,
-                "sent_tickets": 0,
-            }
-
-        if dry_run_result["status"] in {"ignored", "waiting", "error"}:
+        if dry_run_result["status"] in {
+            "ignored",
+            "waiting_payment",
+            "waiting_ticket",
+            "retryable_error",
+            "permanent_error",
+        }:
             return {
                 **dry_run_result,
                 "payment_method": payment_method,
@@ -835,61 +879,69 @@ class OrderMonitorService:
 
         send_result = self.send_order_to_customer(order_id)
         if send_result.get("already_sent"):
-            return {
-                "order_id": order_id,
-                "status": "already_sent",
-                "summary": "ya enviado",
-                "expected_tickets": int(send_result.get("expected_tickets") or 0),
-                "found_tickets": int(send_result.get("found_tickets") or 0),
-                "phone_valid": True,
-                "changed": False,
-                "payment_method": payment_method,
-                "masked_destination": str(send_result.get("masked_destination") or masked_destination),
-                "sent_tickets": 0,
-            }
+            return self._build_result(
+                order_id,
+                "already_sent",
+                "ya enviado",
+                expected_tickets=int(send_result.get("expected_tickets") or 0),
+                found_tickets=int(send_result.get("found_tickets") or 0),
+                phone_valid=True,
+                changed=False,
+                payment_method=payment_method,
+                masked_destination=str(send_result.get("masked_destination") or masked_destination),
+                sent_tickets=0,
+            )
 
         if send_result.get("ok"):
-            return {
-                "order_id": order_id,
-                "status": "sent",
-                "summary": "enviado a telefono de facturacion",
-                "expected_tickets": int(send_result.get("expected_tickets") or 0),
-                "found_tickets": int(send_result.get("found_tickets") or 0),
-                "phone_valid": True,
-                "changed": True,
-                "payment_method": payment_method,
-                "masked_destination": str(send_result.get("masked_destination") or masked_destination),
-                "sent_tickets": int(send_result.get("sent_tickets") or 0),
-            }
+            return self._build_result(
+                order_id,
+                "sent",
+                "enviado a telefono de facturacion",
+                expected_tickets=int(send_result.get("expected_tickets") or 0),
+                found_tickets=int(send_result.get("found_tickets") or 0),
+                phone_valid=True,
+                changed=True,
+                payment_method=payment_method,
+                masked_destination=str(send_result.get("masked_destination") or masked_destination),
+                sent_tickets=int(send_result.get("sent_tickets") or 0),
+            )
 
-        return {
-            "order_id": order_id,
-            "status": "error",
-            "summary": str(send_result.get("reason") or "Error en envio real."),
-            "expected_tickets": int(send_result.get("expected_tickets") or 0),
-            "found_tickets": int(send_result.get("found_tickets") or 0),
-            "phone_valid": bool(normalized_billing_phone),
-            "changed": True,
-            "payment_method": payment_method,
-            "masked_destination": str(send_result.get("masked_destination") or masked_destination),
-            "sent_tickets": int(send_result.get("sent_tickets") or 0),
-        }
+        result_status = "retryable_error"
+        if send_result.get("reason") == "invalid_phone":
+            result_status = "permanent_error"
+        return self._build_result(
+            order_id,
+            result_status,
+            str(send_result.get("reason") or "Error en envio real."),
+            expected_tickets=int(send_result.get("expected_tickets") or 0),
+            found_tickets=int(send_result.get("found_tickets") or 0),
+            phone_valid=bool(normalized_billing_phone),
+            changed=True,
+            payment_method=payment_method,
+            masked_destination=str(send_result.get("masked_destination") or masked_destination),
+            sent_tickets=int(send_result.get("sent_tickets") or 0),
+        )
+
+    @staticmethod
+    def _safe_order_id(order: dict[str, Any]) -> int:
+        try:
+            return int(order.get("id") or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0
 
     @staticmethod
     def _normalize_argentine_phone(phone: Any) -> str | None:
         return normalize_argentine_phone(phone)
 
     @staticmethod
-    def _build_waiting_summary(reasons: set[str], order_status: str) -> str:
+    def _build_waiting_payment_summary(reasons: set[str], order_status: str) -> str:
         if "payment_not_confirmed" in reasons:
             return "pago no confirmado"
         if "still_needs_payment" in reasons:
             return "todavia necesita pago"
         if "status_not_ready" in reasons:
             return f"estado {order_status}"
-        if "missing_phone" in reasons:
-            return "telefono no normalizable"
-        return "en espera"
+        return "en espera de pago"
 
     @staticmethod
     def _build_result(
@@ -900,6 +952,7 @@ class OrderMonitorService:
         found_tickets: int = 0,
         phone_valid: bool = False,
         changed: bool = True,
+        **extra: Any,
     ) -> dict[str, Any]:
         return {
             "order_id": order_id,
@@ -909,6 +962,7 @@ class OrderMonitorService:
             "found_tickets": found_tickets,
             "phone_valid": phone_valid,
             "changed": changed,
+            **extra,
         }
 
     @staticmethod
@@ -928,6 +982,28 @@ class OrderMonitorService:
             and int(previous_state.get("found_tickets") or 0) == found_tickets
             and bool(previous_state.get("phone_normalized")) == phone_valid
         )
+
+    @staticmethod
+    def _build_summary(results: list[dict[str, Any]]) -> dict[str, int]:
+        summary = {
+            "analyzed": len(results),
+            "simulated": 0,
+            "sent": 0,
+            "ignored": 0,
+            "waiting": 0,
+            "errors": 0,
+            "already_sent": 0,
+            "ready": 0,
+        }
+        for item in results:
+            status = str(item.get("status") or "")
+            if status in {"waiting_payment", "waiting_ticket"}:
+                summary["waiting"] += 1
+            elif status in {"retryable_error", "permanent_error"}:
+                summary["errors"] += 1
+            elif status in summary:
+                summary[status] += 1
+        return summary
 
     @staticmethod
     def _build_caption(ticket_pdf: dict[str, Any], index: int, total: int) -> str:

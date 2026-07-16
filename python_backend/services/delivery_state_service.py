@@ -12,10 +12,15 @@ ALLOWED_STATES = {
     "detected",
     "ready",
     "simulated",
+    "sending",
     "sent",
     "ignored",
     "waiting",
+    "waiting_payment",
+    "waiting_ticket",
     "error",
+    "retryable_error",
+    "permanent_error",
 }
 
 
@@ -126,6 +131,12 @@ class DeliveryStateService:
     def mark_waiting(self, order_id: int, **fields: Any) -> dict[str, Any]:
         return self.upsert_order_state(order_id, status="waiting", **fields)
 
+    def mark_waiting_payment(self, order_id: int, **fields: Any) -> dict[str, Any]:
+        return self.upsert_order_state(order_id, status="waiting_payment", **fields)
+
+    def mark_waiting_ticket(self, order_id: int, **fields: Any) -> dict[str, Any]:
+        return self.upsert_order_state(order_id, status="waiting_ticket", **fields)
+
     def mark_error(self, order_id: int, **fields: Any) -> dict[str, Any]:
         attempts = int(fields.pop("attempt_count", 0) or 0)
         current = self.get_order_state(order_id)
@@ -142,6 +153,37 @@ class DeliveryStateService:
 
     def mark_ready(self, order_id: int, **fields: Any) -> dict[str, Any]:
         return self.upsert_order_state(order_id, status="ready", **fields)
+
+    def mark_sending(self, order_id: int, **fields: Any) -> dict[str, Any]:
+        return self.upsert_order_state(order_id, status="sending", **fields)
+
+    def mark_retryable_error(self, order_id: int, **fields: Any) -> dict[str, Any]:
+        attempts = int(fields.pop("attempt_count", 0) or 0)
+        current = self.get_order_state(order_id)
+        if current:
+            attempts = max(attempts, int(current.get("attempt_count") or 0) + 1)
+        else:
+            attempts = max(attempts, 1)
+        return self.upsert_order_state(
+            order_id,
+            status="retryable_error",
+            attempt_count=attempts,
+            **fields,
+        )
+
+    def mark_permanent_error(self, order_id: int, **fields: Any) -> dict[str, Any]:
+        attempts = int(fields.pop("attempt_count", 0) or 0)
+        current = self.get_order_state(order_id)
+        if current:
+            attempts = max(attempts, int(current.get("attempt_count") or 0) + 1)
+        else:
+            attempts = max(attempts, 1)
+        return self.upsert_order_state(
+            order_id,
+            status="permanent_error",
+            attempt_count=attempts,
+            **fields,
+        )
 
     def has_been_sent(self, order_id: int) -> bool:
         state = self.get_order_state(order_id)

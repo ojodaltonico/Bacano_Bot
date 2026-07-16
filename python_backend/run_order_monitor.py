@@ -205,7 +205,7 @@ def run_live_test_cycle(
     changed_items = [item for item in result["results"] if item.get("changed")]
     if changed_items:
         for item in changed_items:
-            if item.get("status") in {"sent", "error"} and (
+            if item.get("status") in {"sent", "retryable_error", "permanent_error"} and (
                 item.get("billing_phone_present") is not None
             ):
                 print(
