@@ -21,6 +21,47 @@ const ALLOWED_DEBUG_DIR = path.resolve(PROJECT_ROOT, "python_backend", "debug")
 
 let activeSock = null
 let internalServerStarted = false
+const processedMessageIds = new Map()
+const MESSAGE_DEDUP_TTL_MS = 10 * 60 * 1000
+
+function maskIdentifier(value) {
+    const text = String(value || "")
+    return text.length <= 4 ? "****" : `${"*".repeat(Math.max(4, text.length - 4))}${text.slice(-4)}`
+}
+
+function rememberIncomingMessage(messageId) {
+    const now = Date.now()
+    for (const [id, timestamp] of processedMessageIds.entries()) {
+        if (now - timestamp > MESSAGE_DEDUP_TTL_MS) processedMessageIds.delete(id)
+    }
+    if (!messageId || processedMessageIds.has(messageId)) return false
+    processedMessageIds.set(messageId, now)
+    return true
+}
+
+function resolveLidFromSession(lid) {
+    try {
+        const files = fs.readdirSync(AUTH_FOLDER)
+        for (const filename of files) {
+            if (!filename.startsWith("lid-mapping-") || filename.endsWith("_reverse.json")) continue
+            const mappedLid = JSON.parse(fs.readFileSync(path.join(AUTH_FOLDER, filename), "utf8"))
+            if (String(mappedLid) !== String(lid)) continue
+            const phone = filename.slice("lid-mapping-".length, -".json".length)
+            return /^\d+$/.test(phone) ? `${phone}@s.whatsapp.net` : null
+        }
+    } catch (error) {
+        console.error("LID mapping lookup failed:", sanitizeErrorName(error))
+    }
+    return null
+}
+
+function resolveIncomingJid(msg) {
+    const primary = String(msg.key?.remoteJid || "")
+    const alternate = String(msg.key?.remoteJidAlt || "")
+    if (!primary.endsWith("@lid")) return primary
+    if (alternate.endsWith("@s.whatsapp.net")) return alternate
+    return resolveLidFromSession(primary.split("@", 1)[0]) || primary
+}
 
 function isLocalRequest(req) {
     const remote = req.socket?.remoteAddress || ""
@@ -298,11 +339,19 @@ async function startBot() {
 
     sock.ev.on("creds.update", saveCreds)
 
-    sock.ev.on("messages.upsert", async ({ messages }) => {
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+        if (type !== "notify") return
         const msg = messages[0]
         if (!msg.message || msg.key.fromMe) return
 
+        const messageId = String(msg.key.id || "")
+        if (!rememberIncomingMessage(messageId)) {
+            console.log(`Mensaje duplicado ignorado: ${messageId || "sin-id"}`)
+            return
+        }
+
         const from = msg.key.remoteJid
+        const resolvedFrom = resolveIncomingJid(msg)
         const text =
             msg.message.conversation ||
             msg.message.extendedTextMessage?.text ||
@@ -310,10 +359,13 @@ async function startBot() {
 
         if (!text) return
 
-        console.log(`Mensaje recibido de ${from}: "${text}"`)
+        console.log(
+            `Mensaje recibido: id=${messageId || "sin-id"} origen=${maskIdentifier(from)} ` +
+            `resuelto=${maskIdentifier(resolvedFrom)} texto=${JSON.stringify(text)}`
+        )
 
         try {
-            const webhookData = { from, message: text }
+            const webhookData = { from: resolvedFrom, message: text }
 
             const resp = await axios.post(
                 "http://localhost:5000/webhook",

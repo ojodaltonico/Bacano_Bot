@@ -603,6 +603,49 @@ class OrderMonitorServiceTests(unittest.TestCase):
         self.assertEqual(len(sent_pdfs), 0)
         self.assertEqual(state.states[50000]["status"], "awaiting_customer_confirmation")
 
+    def test_unregistered_whatsapp_number_is_permanent_and_not_retried(self):
+        order = ticket_order()
+        delivery_info = {
+            50000: {
+                "billing_phone": "2939407879",
+                "expected_tickets": 2,
+                "status": "processing",
+                "payment_method": "woo-mercado-pago-custom",
+                "not_ready_reasons": [],
+            }
+        }
+        prepare = {
+            50000: {
+                "ready": True,
+                "expected_tickets": 2,
+                "found_tickets": 2,
+                "ticket_pdfs": [
+                    {"pdf_path": "C:/tmp/ticket-1.pdf", "event_name": "Bacano Fest", "ticket_type": "General"}
+                ],
+            }
+        }
+        service, _, _, state = self.make_service(
+            pages={1: [order]},
+            delivery_info=delivery_info,
+            prepare=prepare,
+        )
+        send_attempts = []
+        original_text = OrderMonitorService._send_text_to_bot
+        OrderMonitorService._send_text_to_bot = staticmethod(
+            lambda phone, text: (send_attempts.append((phone, text)) and True, "Numero no registrado en WhatsApp")
+        )
+        try:
+            first = service.live_recent_orders(limit=20, after_order_id=49999)
+            second = service.live_recent_orders(limit=20, after_order_id=49999)
+        finally:
+            OrderMonitorService._send_text_to_bot = original_text
+
+        self.assertEqual(first["results"][0]["status"], "permanent_error")
+        self.assertEqual(second["results"][0]["status"], "permanent_error")
+        self.assertFalse(second["results"][0]["changed"])
+        self.assertEqual(state.states[50000]["status"], "permanent_error")
+        self.assertEqual(len(send_attempts), 1)
+
     def test_affirmative_si_triggers_pending_delivery(self):
         order = ticket_order()
         delivery_info = {
@@ -654,6 +697,10 @@ class OrderMonitorServiceTests(unittest.TestCase):
         service, _, _, _ = self.make_service(pages={})
         result = service.confirm_pending_customer_deliveries("5492939407879", "tal vez")
         self.assertFalse(result["handled"])
+
+    def test_affirmative_si_with_accent_is_accepted(self):
+        self.assertTrue(OrderMonitorService._is_affirmative_message("SÍ"))
+        self.assertTrue(OrderMonitorService._is_affirmative_message(" sí "))
 
 
 if __name__ == "__main__":

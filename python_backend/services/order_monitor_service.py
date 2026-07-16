@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 import time
+import unicodedata
 from typing import Any
 
 import requests
@@ -18,6 +20,7 @@ DEBUG_DIR = Path(__file__).resolve().parent.parent / "debug"
 ENDPOINT_URL = "http://127.0.0.1:3000/internal/send-document"
 REQUEST_TIMEOUT = 30
 MERCADO_PAGO_METHOD = "woo-mercado-pago-custom"
+logger = logging.getLogger(__name__)
 
 
 class OrderMonitorService:
@@ -494,7 +497,13 @@ class OrderMonitorService:
         )
         ok, detail = self._send_text_to_bot(normalized_billing_phone, intro_message)
         if not ok:
-            self._delivery_state_service.mark_retryable_error(
+            permanent_error = self._is_permanent_destination_error(detail)
+            mark_error = (
+                self._delivery_state_service.mark_permanent_error
+                if permanent_error
+                else self._delivery_state_service.mark_retryable_error
+            )
+            mark_error(
                 order_id,
                 payment_method=delivery_info.get("payment_method"),
                 order_status=delivery_info.get("status"),
@@ -503,7 +512,7 @@ class OrderMonitorService:
                 sent_tickets=0,
                 phone_normalized=normalized_billing_phone,
                 last_error=detail,
-                metadata_json={"summary": "intro send failed"},
+                metadata_json={"summary": "intro destination rejected" if permanent_error else "intro send failed"},
             )
             return {
                 "ok": False,
@@ -518,7 +527,7 @@ class OrderMonitorService:
                 "billing_phone_present": billing_phone_present,
                 "billing_phone_normalizable": True,
                 "masked_destination": masked_billing_phone,
-                "state_saved": "retryable_error",
+                "state_saved": "permanent_error" if permanent_error else "retryable_error",
             }
 
         self._delivery_state_service.mark_awaiting_customer_confirmation(
@@ -695,6 +704,12 @@ class OrderMonitorService:
 
     def confirm_pending_customer_deliveries(self, phone: str, message: str) -> dict[str, Any]:
         normalized_phone = self._normalize_argentine_phone(phone)
+        normalized_message = self._normalize_confirmation_text(message)
+        logger.info(
+            "Confirmacion recibida: telefono=%s texto=%s",
+            mask_phone(normalized_phone or phone),
+            normalized_message,
+        )
         if not normalized_phone:
             return {"handled": False, "reason": "invalid_phone"}
         if not self._is_affirmative_message(message):
@@ -702,6 +717,11 @@ class OrderMonitorService:
 
         pending_orders = self._delivery_state_service.list_pending_customer_confirmations(
             normalized_phone
+        )
+        logger.info(
+            "Confirmacion pendientes: telefono=%s orders=%s",
+            mask_phone(normalized_phone),
+            [int(item.get("order_id") or 0) for item in pending_orders],
         )
         if not pending_orders:
             return {"handled": False, "reason": "no_pending_deliveries"}
@@ -1144,6 +1164,20 @@ class OrderMonitorService:
         masked_destination = mask_phone(normalized_billing_phone or delivery_info.get("billing_phone"))
         previous_state = self._delivery_state_service.get_order_state(order_id)
 
+        if previous_state and previous_state.get("status") == "permanent_error":
+            return self._build_result(
+                order_id,
+                "permanent_error",
+                str(previous_state.get("last_error") or "error permanente"),
+                expected_tickets=int(previous_state.get("expected_tickets") or 0),
+                found_tickets=int(previous_state.get("found_tickets") or 0),
+                phone_valid=bool(normalized_billing_phone),
+                changed=False,
+                payment_method=payment_method,
+                masked_destination=masked_destination,
+                sent_tickets=int(previous_state.get("sent_tickets") or 0),
+            )
+
         if previous_state and previous_state.get("status") == "awaiting_customer_confirmation":
             return self._build_result(
                 order_id,
@@ -1213,7 +1247,7 @@ class OrderMonitorService:
             )
 
         result_status = "retryable_error"
-        if send_result.get("reason") == "invalid_phone":
+        if self._is_permanent_destination_error(send_result.get("reason")):
             result_status = "permanent_error"
         return self._build_result(
             order_id,
@@ -1422,15 +1456,19 @@ class OrderMonitorService:
 
     @staticmethod
     def _is_affirmative_message(message: str) -> bool:
-        normalized = (
-            str(message or "")
-            .strip()
-            .lower()
-            .replace("í", "i")
-            .replace("ì", "i")
-            .replace("ï", "i")
+        return OrderMonitorService._normalize_confirmation_text(message) == "si"
+
+    @staticmethod
+    def _normalize_confirmation_text(message: str) -> str:
+        return "".join(
+            char for char in unicodedata.normalize("NFD", str(message or "").strip().lower())
+            if unicodedata.category(char) != "Mn"
         )
-        return normalized == "si"
+
+    @staticmethod
+    def _is_permanent_destination_error(reason: Any) -> bool:
+        normalized = OrderMonitorService._normalize_confirmation_text(str(reason or ""))
+        return normalized in {"invalid_phone", "numero no registrado en whatsapp"}
 
     def _deliver_confirmed_order_to_customer(
         self,
@@ -1466,6 +1504,12 @@ class OrderMonitorService:
         )
 
         total = len(ticket_pdfs)
+        logger.info(
+            "Envio confirmado iniciado: order_id=%s telefono=%s pdfs=%s",
+            order_id,
+            mask_phone(normalized_phone),
+            total,
+        )
         sent_results: list[dict[str, Any]] = []
         for index, ticket_pdf in enumerate(ticket_pdfs, start=1):
             pdf_path = Path(ticket_pdf["pdf_path"])
@@ -1479,6 +1523,14 @@ class OrderMonitorService:
                 caption,
             )
             sent_results.append({"index": index, "ok": ok, "detail": detail})
+            logger.info(
+                "Resultado PDF: order_id=%s indice=%s/%s ok=%s detalle=%s",
+                order_id,
+                index,
+                total,
+                ok,
+                detail,
+            )
             if not ok:
                 self._delivery_state_service.mark_retryable_error(
                     order_id,
